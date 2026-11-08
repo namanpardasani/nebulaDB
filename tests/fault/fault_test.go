@@ -85,13 +85,14 @@ func TestDiskFullSweep(t *testing.T) {
 			d := open(t, o)
 			fs.SetDiskLimit(limit)
 			acked := map[string]string{}
-			var firstErr error
+			var firstErr, lastErr error
 			for i := 0; i < 600; i++ {
-				if errors.Is(firstErr, engine.ErrWriteStall) {
+				if errors.Is(lastErr, engine.ErrWriteStall) {
 					break // flushing cannot make progress on a full disk: writers are being refused
 				}
 				k, v := fmt.Sprintf("k%03d", i%90), fmt.Sprintf("v%d-%s", i, strings.Repeat("p", 40))
 				ok, err := d.Set(b(k), b(v), engine.SetOptions{})
+				lastErr = err
 				if err != nil {
 					if firstErr == nil {
 						firstErr = err
@@ -113,8 +114,17 @@ func TestDiskFullSweep(t *testing.T) {
 			}
 			// ...free some space, and the engine recovers by itself.
 			fs.SetDiskLimit(-1)
-			if _, err := d.Set(b("after-recovery"), b("ok"), engine.SetOptions{}); err != nil {
-				t.Fatalf("writes did not resume after space was freed: %v", err)
+			// Recovery is automatic but not instant: the flusher retries on a
+			// 500 ms timer. Writes must resume within a few seconds, no restart.
+			var rerr error
+			for try := 0; try < 40; try++ {
+				if _, rerr = d.Set(b("after-recovery"), b("ok"), engine.SetOptions{}); rerr == nil {
+					break
+				}
+				time.Sleep(150 * time.Millisecond)
+			}
+			if rerr != nil {
+				t.Fatalf("writes did not resume within 6s after space was freed: %v", rerr)
 			}
 			acked["after-recovery"] = "ok"
 			if err := d.WaitForFlush(); err != nil {
