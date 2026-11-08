@@ -40,6 +40,7 @@ type Config struct {
 	Addr      string // RESP listen address
 	AdminAddr string // admin HTTP listen address ("" disables)
 	MaxConns  int    // max simultaneous client connections
+	InMemory  bool   // volatile engine, no WAL (testing / cache use)
 
 	Fsync         FsyncPolicy
 	FsyncInterval time.Duration // for FsyncEvery
@@ -98,6 +99,7 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.Dir, "dir", c.Dir, "data directory")
 	fs.StringVar(&c.Addr, "addr", c.Addr, "RESP listen address")
 	fs.StringVar(&c.AdminAddr, "admin-addr", c.AdminAddr, "admin HTTP address (empty disables)")
+	fs.BoolVar(&c.InMemory, "in-memory", c.InMemory, "run without persistence (data lost on exit)")
 	fs.IntVar(&c.MaxConns, "max-conns", c.MaxConns, "maximum concurrent client connections")
 
 	fs.Func("fsync", "WAL fsync policy: always | every | never (default always)", func(s string) error {

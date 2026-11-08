@@ -14,6 +14,8 @@ import (
 	"github.com/naman/nebuladb/internal/engine"
 	"github.com/naman/nebuladb/internal/logx"
 	"github.com/naman/nebuladb/internal/server"
+	"github.com/naman/nebuladb/internal/vfs"
+	"github.com/naman/nebuladb/internal/wal"
 )
 
 func main() {
@@ -34,15 +36,40 @@ func run() error {
 		return err
 	}
 
-	// Phase 2: in-memory engine. Replaced by the LSM engine in later phases.
-	eng := engine.NewMem()
+	// Phase 3: durable map engine (WAL + replay). Replaced by the LSM engine in
+	// later phases behind the same engine.Engine interface.
+	var eng *engine.Mem
+	if cfg.InMemory {
+		eng = engine.NewMem()
+		log.Warn("running WITHOUT persistence (-in-memory): data is lost on exit")
+	} else {
+		policy := wal.SyncAlways
+		switch cfg.Fsync {
+		case config.FsyncEvery:
+			policy = wal.SyncEvery
+		case config.FsyncNever:
+			policy = wal.SyncNever
+			log.Warn("fsync=never: acknowledged writes can be lost on power failure")
+		}
+		var info wal.RecoveryInfo
+		var err error
+		eng, info, err = engine.OpenMem(engine.MemOptions{WAL: wal.Options{
+			FS: vfs.Default, Dir: cfg.Dir, Policy: policy, Interval: cfg.FsyncInterval,
+			GroupCommit: cfg.GroupCommit, Logger: log,
+		}})
+		if err != nil {
+			return fmt.Errorf("recovery failed: %w", err)
+		}
+		log.Info("recovery complete", "dir", cfg.Dir, "batches", info.Batches, "last_seq", info.LastSeq,
+			"torn_tail", info.TornTail, "truncated_bytes", info.TruncatedBytes)
+	}
 
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
 	srv := server.New(eng, server.Options{MaxConns: cfg.MaxConns, Logger: log})
-	log.Info("nebuladb listening", "addr", ln.Addr().String(), "engine", "mem", "fsync", cfg.Fsync)
+	log.Info("nebuladb listening", "addr", ln.Addr().String(), "engine", "mem+wal", "fsync", cfg.Fsync, "group_commit", cfg.GroupCommit)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Op identifies a filesystem operation that a fault rule can target.
@@ -106,10 +107,11 @@ type Faulty struct {
 	pending []pendingDirOp
 	gen     int // incremented by Crash; stale handles error out
 
-	limit    int64 // disk capacity in bytes; <0 = unlimited
-	syncs    int
-	writes   int
-	crashRng *rand.Rand
+	limit     int64 // disk capacity in bytes; <0 = unlimited
+	syncDelay time.Duration
+	syncs     int
+	writes    int
+	crashRng  *rand.Rand
 }
 
 // NewFaulty wraps inner. Files that already exist are treated as durable.
@@ -149,6 +151,14 @@ func (f *Faulty) FlipOnRead(match string, offset int64, mask byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.flips = append(f.flips, flipRule{match, offset, mask})
+}
+
+// SetSyncDelay makes every file Sync sleep for d, emulating a slow disk. Tests
+// use it to give group commit something to amortise.
+func (f *Faulty) SetSyncDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncDelay = d
 }
 
 // SyncCount / WriteCount report how many fsyncs and writes went through, so
@@ -486,6 +496,9 @@ func (h *faultyFile) Sync() error {
 		return ErrCrashed
 	}
 	f.syncs++
+	if f.syncDelay > 0 {
+		time.Sleep(f.syncDelay)
+	}
 	if r := f.match(OpSync, h.name); r != nil {
 		return ruleErr(r)
 	}
