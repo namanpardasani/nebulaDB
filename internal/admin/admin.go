@@ -13,7 +13,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/naman/nebuladb/internal/engine"
@@ -571,7 +570,11 @@ func (a *Server) devCrash(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		// Process.Kill is SIGKILL on Unix and TerminateProcess on Windows: no
+		// deferred functions, no flush, no fsync.
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			p.Kill()
+		}
 	}()
 }
 
