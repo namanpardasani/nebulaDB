@@ -73,7 +73,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 	}
 	e, _, err := engine.Open(engine.Options{
 		Dir: dir, Sync: p, SyncEvery: opts.SyncInterval,
-		GroupCommit: !opts.DisableGroupCommit, MemtableSize: opts.MemtableSize, Logger: opts.Logger,
+		GroupCommit: !opts.DisableGroupCommit, MemtableSize: opts.MemtableSize, BloomBits: 10, Logger: opts.Logger,
 	})
 	if err != nil {
 		return nil, err

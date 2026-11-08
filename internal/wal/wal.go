@@ -58,6 +58,14 @@ type Options struct {
 	// SSTables). New sequence numbers start above max(StartSeq, replayed).
 	StartSeq uint64
 	Logger   *slog.Logger
+	// AfterGroup, if set, runs on the group leader after EVERY apply callback of
+	// a group has finished (and after any barriers). At that moment each record
+	// in the active segment has been applied, so it is the one safe point for
+	// sealing the segment together with the memtable that holds its contents.
+	// Rotating between two batches of the same group would put a batch whose
+	// record lives in the old segment into the NEW memtable, and deleting the old
+	// segment after the old memtable's flush would then lose it.
+	AfterGroup func()
 }
 
 // RecoveryInfo reports what Open found.
@@ -113,7 +121,8 @@ type WAL struct {
 }
 
 type request struct {
-	batch    *Batch
+	batch    *Batch // nil for a barrier
+	barrier  func() // non-nil for a barrier: runs in log order, writes nothing
 	apply    func(firstSeq uint64)
 	err      error
 	finished bool          // guarded by the leader hand-off protocol
@@ -328,8 +337,20 @@ func (w *WAL) Commit(b *Batch, apply func(firstSeq uint64)) error {
 	if encodedSize(b)-headerSize > maxPayloadSize {
 		return ErrBatchTooLarge
 	}
-	r := &request{batch: b, apply: apply, wake: make(chan struct{}, 1)}
+	return w.submit(&request{batch: b, apply: apply, wake: make(chan struct{}, 1)})
+}
 
+// Barrier runs fn on the group-commit leader without writing anything. fn runs
+// after all apply callbacks of the group the barrier landed in, so every record
+// written so far has been applied and no apply callback is running: the safe
+// place for operations that must not race with memtable inserts (forced memtable
+// rotation).
+func (w *WAL) Barrier(fn func()) error {
+	return w.submit(&request{barrier: fn, wake: make(chan struct{}, 1)})
+}
+
+// submit enqueues r and drives the leader/follower protocol (see Commit).
+func (w *WAL) submit(r *request) error {
 	w.qmu.Lock()
 	w.queue = append(w.queue, r)
 	leader := !w.writing
@@ -356,7 +377,10 @@ func (w *WAL) Commit(b *Batch, apply func(firstSeq uint64)) error {
 		if !w.opts.GroupCommit && n == 1 {
 			break
 		}
-		sz := encodedSize(w.queue[n].batch)
+		sz := 0
+		if w.queue[n].batch != nil {
+			sz = encodedSize(w.queue[n].batch)
+		}
 		if n > 0 && bytes+sz > w.opts.MaxGroupBytes {
 			break
 		}
@@ -398,12 +422,19 @@ func (w *WAL) commitGroup(group []*request) {
 		return
 	}
 	// Durable: apply in log order. Done outside fmu so apply may call Rotate.
-	seq := group[0].batch.Seq
 	for _, g := range group {
-		if g.apply != nil {
-			g.apply(seq)
+		if g.batch != nil && g.apply != nil {
+			g.apply(g.batch.Seq)
 		}
-		seq += uint64(len(g.batch.Ops))
+	}
+	// Barriers and AfterGroup run only once the whole group is applied.
+	for _, g := range group {
+		if g.batch == nil {
+			g.barrier()
+		}
+	}
+	if w.opts.AfterGroup != nil {
+		w.opts.AfterGroup()
 	}
 }
 
@@ -421,6 +452,9 @@ func (w *WAL) writeGroup(group []*request) error {
 	w.buf = w.buf[:0]
 	var ops uint64
 	for _, g := range group {
+		if g.batch == nil {
+			continue // barrier: nothing to write
+		}
 		g.batch.Seq = seq
 		var err error
 		if w.buf, err = appendRecord(w.buf, g.batch); err != nil {
@@ -430,6 +464,9 @@ func (w *WAL) writeGroup(group []*request) error {
 		ops += uint64(len(g.batch.Ops))
 	}
 
+	if len(w.buf) == 0 { // group of barriers only
+		return nil
+	}
 	if n, err := w.f.Write(w.buf); err != nil || n != len(w.buf) {
 		if err == nil {
 			err = errors.New("wal: short write")

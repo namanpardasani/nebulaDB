@@ -52,7 +52,8 @@ func run() error {
 		db, info, err := engine.Open(engine.Options{
 			FS: vfs.Default, Dir: cfg.Dir,
 			Sync: policy, SyncEvery: cfg.FsyncInterval, GroupCommit: cfg.GroupCommit,
-			MemtableSize: cfg.MemtableSize, Logger: log,
+			MemtableSize: cfg.MemtableSize, MaxImmutables: cfg.MaxImmutables,
+			BlockSize: cfg.BlockSize, BloomBits: cfg.BloomBitsKey, Logger: log,
 		})
 		if err != nil {
 			return fmt.Errorf("recovery failed: %w", err)

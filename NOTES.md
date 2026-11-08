@@ -21,7 +21,18 @@ op      = type u8 (1=put,2=delete) | keyLen u32 | valLen u32 | expireAt i64 (uni
 ```
 One record = one atomic batch; its ops get seq, seq+1, ... Segments are numbered files; the old segment is fsynced on rotation so only the NEWEST segment can have a torn tail.
 
-## Guarantees
+### SSTable (`NNNNNN.sst`, little endian) — internal/sstable/format.go
+```
+data blocks* | filter block (Bloom over USER keys, optional) | index block | properties block | footer(64B)
+block   = contents | compression u8 (0) | crc32c(contents+compression byte) u32
+entry   = shared uv | unshared uv | valueLen uv | kind u8 | seq uv | expireAt uv | keySuffix | value   (prefix compressed, restart point every 16 entries)
+block tail = restart offsets u32* | numRestarts u32
+index   = block whose entries are (lastInternalKey of data block -> handle{offset u64,size u64}): sparse, one entry per data block
+footer  = filterHandle(16) indexHandle(16) propsHandle(16) version u32 crc32c(first 52 bytes) u32 magic u64 "NEBULSST"
+```
+Point lookup = footer + (cached) index → binary search → ONE data block read, preceded by a Bloom check. Footer is written last, so a table cut short by a crash has no valid footer and is rejected.
+### MANIFEST (`MANIFEST-NNNNNN`) + `CURRENT` — internal/manifest
+Record = len u32 | crc32c u32 | edit. Edit = tagged varints: logNumber, nextFileNum, lastSeq, add-file(level,num,size,entries,deletes,minSeq,maxSeq,smallest,largest), delete-file(level,num). CURRENT = `MANIFEST-NNNNNN\n`, replaced atomically (tmp + fsync + rename + dir fsync). Log is rewritten as one snapshot edit when > threshold. Torn-tail rule identical to the WAL's.
 ### WAL / fsync policies (Phase 3)
 | policy | process kill -9 | power loss / kernel crash |
 |---|---|---|
@@ -49,6 +60,13 @@ One record = one atomic batch; its ops get seq, seq+1, ... Segments are numbered
 - (P4) Rotation happens on the WAL group leader after apply: `wal.Rotate()` (fsync old segment, create+dir-sync new) first, then swap memtables under the write lock. If Rotate fails the big memtable stays and rotation is retried on the next write.
 - (P4) DBSIZE = puts - 2*tombstones over memtables (approximate; documented). FLUSHDB deletes in atomic chunks of 10k keys (not atomic as a whole across a crash).
 - (P4) Memtable accounting: key+value+64B node overhead+8B per level.
+- (P5) SSTable keeps ALL versions at flush (no dropping); compaction (Phase 7) removes shadowed versions/tombstones. Bloom filter covers user keys, 10 bits/key by default (`-bloom-bits`). Bloom was pulled forward from Phase 6 because the file format needs the filter slot; Phase 6 adds the block cache and measurement.
+- (P5) Flush order (crash-safe): write `NNNNNN.sst.tmp` -> fsync -> rename -> fsync dir -> open+validate -> append edit {add L0 file, logNumber=WAL boundary, lastSeq} to MANIFEST (fsync) -> install new in-memory version + drop the immutable memtable atomically under one lock (readers see the memtable or the table, never neither) -> delete WAL segments < boundary. Crash anywhere: orphan .sst/.tmp are deleted at startup; WAL is replayed from `logNumber`.
+- (P5) File numbers (tables, manifests) come from the manifest's counter; WAL segment numbers are a separate counter (`logNumber` refers to WAL numbering).
+- (P5) Versions are immutable and reference-counted; a table replaced by an edit is marked obsolete and only closed+deleted when the last version/iterator referencing it is released (needed by compaction in Phase 7).
+- (P5) Backpressure v1: writers stall (sync.Cond) while `len(immutables) >= MaxImmutables` (default 2); give up with ErrWriteStall after StallTimeout (30s) so a dead disk cannot hang clients. L0-count based slowdown/stop comes with compaction in Phase 7.
+- (P5) Missing live table or CURRENT-less dir with .sst files => refuse to start (never silently drop data). Corrupt data block => read returns an error (SSTable CRCs), never wrong data.
+- (P5) Close() does not flush the active memtable: WAL replay recovers it. Open file descriptors: all live tables stay open (fd cache is a later refinement).
 - Commit policy (user request): no Claude/Co-Authored-By attribution in commits.
 - Module path `github.com/naman/nebuladb` (local only; no remote). Go 1.27.3 toolchain on dev machine.
 - All I/O goes through `internal/vfs` (added to the layout; not in the brief's list). `Faulty` wraps any FS and supports: rule-based errors (skip N, fail M, sticky), torn/short writes (`Partial`), ENOSPC via a disk-size cap, read-time bit flips, and `Crash()` power-loss simulation. Crash drops unsynced file bytes (or keeps a random torn prefix) AND undoes create/rename/remove that were never made durable with `SyncDir` (backing up overwritten content to restore it). This is adversarial on purpose: it is what proves the temp-file + fsync + rename + dir-fsync recipe (`vfs.WriteFileAtomic`) is needed.
@@ -72,6 +90,18 @@ Phase 10 will re-run these properly (multiple counts, benchstat).
 - **Fix:** return the `nx` that the level-0 loop itself observed failing the "before target" test (never re-read the link).
 - **Test added:** `internal/memtable/snap_test.go` (TestSnapshotBatchesNeverTorn) and the engine-level `TestBatchAtomicVisibility`. Lesson: in lock-free structures, a pointer you test must be the pointer you use.
 
+### 2. Acknowledged write lost after flush: rotation in the middle of a group commit (Phase 5)
+- **Symptom:** `TestPowerLossDuringFlushLosesNothingAcked`, round 0: after a simulated power loss, an acknowledged write (`g3-k043="v3-443"`) was gone; the older `v3-393` was recovered.
+- **Cause:** group commit writes a whole group (many batches) into WAL segment S in one write, then applies the batches to the memtable one by one. Memtable/WAL rotation was triggered from inside each batch's apply callback, i.e. possibly BETWEEN two batches of the same group. A later batch of that group (record already in S) was then applied to the NEW memtable. When the sealed memtable was flushed the manifest's WAL boundary allowed S to be deleted, so that batch's only durable copy vanished and it lived only in RAM.
+- **Fix:** rotate only at group boundaries: `wal.Options.AfterGroup` runs on the leader after every apply of a group (barriers moved to the same point). Plus a defensive invariant in `DB.rotate`: refuse to seal unless `memtable.maxSeq == wal.LastSeq()` (counts `rotation_errors` instead of risking data).
+- **Tests added:** `TestRotationAtGroupBoundaryOnly` (slow-fsync FS forces multi-batch groups; fails with 339 invariant violations when the bug is reintroduced, verified), and the random-moment power-loss test above.
+- **Second finding while writing that test (test bug, not engine bug):** after a torn-tail crash the recovered value can be NEWER than the last acknowledged one (a write that was in flight, written but not yet acknowledged, may partially persist). Correct assertion: recovered value >= last acked, never older.
+
+### 3. Manifest append failure poisoned flushing forever (Phase 5, found by TestFlushFailureStagesAreSafe/write_manifest)
+- **Symptom:** after a transient write error on the MANIFEST, `WaitForFlush` hung for ever even after the fault cleared.
+- **Cause:** any failed append marked the manifest permanently read-only.
+- **Fix:** like the WAL, truncate the partial record away and continue (ENOSPC is recoverable); only poison if the tail cannot be repaired or fsync fails. Test: `TestAppendFailureRollbackAndFsyncPoison`.
+
 ## Interview Q&A
 
 ## Progress log
@@ -85,4 +115,6 @@ Phase 10 will re-run these properly (multiple counts, benchstat).
   No bugs found by tests this phase besides my own test mistakes (shared rand across goroutines; wrong expected seq).
 - Phase 4 DONE: internal/iterator (Entry/Iterator, heap Merge, snapshot View), internal/memtable (lock-free-read skip list), engine.DB (LSM engine with memtables+WAL+rotation; server now uses it by default), pkg/nebuladb embedded API, MGET snapshot reads. Tests: skip list vs sorted oracle, concurrent readers+writer under -race, conformance suite on DB at default and 1KiB memtable, shadowing across 3+ immutables, restart across multiple WAL segments, seeded model test vs map oracle (5 seeds x 1500 random ops incl. restarts/TTL/INCR/MSET/PERSIST/SCAN), power-loss test with concurrent writers + rotation (12 rounds, 0 acked writes lost). kill -9 + redis-cli smoke with rotation passed. 1 bug found (above).
   KNOWN ISSUES: origin push still pending (see Phase 2 note). Immutable memtables accumulate until Phase 5 flush.
-  Next: Phase 5 (SSTable writer/reader, flush, MANIFEST/CURRENT, startup from SSTables + WAL).
+- Phase 5 DONE: internal/bloom (measured FP rates match theory), internal/sstable (blocks, prefix compression, sparse index, filter, footer, reader/iterator, Verify), internal/manifest (edits, CURRENT, torn-tail repair, snapshot rewrite), engine: versions with refcounts, flush worker, crash-safe startup, orphan cleanup, write stall, events hook. Tests: 100% of truncations and single-byte flips of an SSTable detected, 4 fuzz targets (sstable x2, manifest x2, bloom, wal) run clean, flush failure at 5 stages, write stall + resume, 25 random-moment power-loss rounds with concurrent flush (0 acked writes lost), kill -9 + redis-cli check. 3 bugs found (see above). build/vet/`go test -race ./...` clean.
+  KNOWN ISSUES: origin push still pending (force-push approval needed, see Phase 2 note). L0 files accumulate until Phase 7 compaction (reads check every L0 file whose key range matches). Block cache not yet wired (Phase 6).
+  Next: Phase 6 (block cache, SCAN polish, Bloom stats in INFO, iterator tests over tables).

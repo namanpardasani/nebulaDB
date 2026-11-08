@@ -67,15 +67,22 @@ func TestRotationAndShadowing(t *testing.T) {
 	d.Set(v("victim"), v("old"), engine.SetOptions{})
 	d.Set(v("overwritten"), v("v1"), engine.SetOptions{})
 	d.Set(v("ttl"), v("x"), engine.SetOptions{ExpireAtMs: clk.Now() + 100})
-	// Fill until at least 3 memtables are sealed.
-	for i := 0; stat(d, "immutable_memtables") < "3"; i++ {
+	// Fill until at least 3 memtables were sealed (and, in the background,
+	// flushed to SSTables): the old values now live on disk.
+	for i := 0; stat(d, "memtable_rotations") < "3"; i++ {
 		d.Set(v(fmt.Sprintf("fill%05d", i)), make([]byte, 100), engine.SetOptions{})
 		if i > 10000 {
 			t.Fatal("memtable never rotated")
 		}
 	}
+	if err := d.WaitForFlush(); err != nil {
+		t.Fatal(err)
+	}
+	if stat(d, "table_files") == "0" {
+		t.Fatal("expected SSTables on disk")
+	}
 	// Tombstone / overwrite / expiry in the NEW memtable must hide data that
-	// lives in OLD immutable memtables.
+	// lives in OLD SSTables.
 	d.Del([][]byte{v("victim")})
 	d.Set(v("overwritten"), v("v2"), engine.SetOptions{})
 	clk.Advance(100)
@@ -133,8 +140,8 @@ func TestRestartAfterRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d2.Close()
-	if info.Segments == nil || len(info.Segments) < 2 {
-		t.Fatalf("expected multiple WAL segments, got %v", info.Segments)
+	if stat(d2, "table_files") == "0" {
+		t.Fatalf("expected SSTables to be recovered from the MANIFEST; wal segments replayed: %v", info.Segments)
 	}
 	for i := 0; i < 120; i++ {
 		k := fmt.Sprintf("k%03d", i)
@@ -351,8 +358,9 @@ func TestDBCrashLosesNoAckedWrite(t *testing.T) {
 				}()
 			}
 			wg.Wait()
-			if stat(d, "memtable_rotations") == "0" {
-				t.Fatal("expected WAL rotations during the run")
+			d.WaitForFlush()
+			if stat(d, "memtable_rotations") == "0" || stat(d, "flushes") == "0" {
+				t.Fatal("expected rotations and flushes during the run")
 			}
 			fs.AddRule(vfs.Rule{Op: vfs.OpSync, Match: ".wal", Count: -1})
 			d.Set([]byte("inflight"), []byte("x"), engine.SetOptions{}) // fails: never acked

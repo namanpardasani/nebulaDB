@@ -1,18 +1,28 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/naman/nebuladb/internal/iterator"
+	"github.com/naman/nebuladb/internal/manifest"
 	"github.com/naman/nebuladb/internal/memtable"
+	"github.com/naman/nebuladb/internal/sstable"
 	"github.com/naman/nebuladb/internal/vfs"
 	"github.com/naman/nebuladb/internal/wal"
 )
+
+// ErrWriteStall is returned when writers have been blocked for longer than
+// Options.StallTimeout because background flushing cannot keep up (or is
+// failing, e.g. disk full).
+var ErrWriteStall = errors.New("write stalled: memtable flush is not keeping up")
 
 // Options configures the LSM engine (DB).
 type Options struct {
@@ -26,9 +36,19 @@ type Options struct {
 	// MemtableSize is the approximate byte size at which the active memtable is
 	// sealed (becomes immutable) and a new memtable + WAL segment start.
 	MemtableSize int64
+	// MaxImmutables is how many sealed memtables may await flushing before
+	// writers stall (backpressure). Default 2.
+	MaxImmutables int
+	// StallTimeout bounds how long a writer waits for flush progress. Default 30s.
+	StallTimeout time.Duration
 
-	Now    func() int64 // unix ms clock; nil = wall clock
-	Logger *slog.Logger
+	BlockSize   int // SSTable data block size (default 4096)
+	BloomBits   int // Bloom filter bits per key (0 disables; default set by caller)
+	ManifestMax int64
+
+	Now     func() int64 // unix ms clock; nil = wall clock
+	Logger  *slog.Logger
+	OnEvent func(Event) // optional engine event sink (must not block)
 }
 
 func (o *Options) fill() {
@@ -37,6 +57,15 @@ func (o *Options) fill() {
 	}
 	if o.MemtableSize <= 0 {
 		o.MemtableSize = 4 << 20
+	}
+	if o.MaxImmutables <= 0 {
+		o.MaxImmutables = 2
+	}
+	if o.StallTimeout <= 0 {
+		o.StallTimeout = 30 * time.Second
+	}
+	if o.BlockSize <= 0 {
+		o.BlockSize = 4 << 10
 	}
 	if o.Now == nil {
 		o.Now = func() int64 { return time.Now().UnixMilli() }
@@ -50,8 +79,8 @@ func (o *Options) fill() {
 type immutable struct {
 	mt *memtable.Memtable
 	// walBoundary: every record of this memtable lives in WAL segments numbered
-	// below it, so once the memtable is safely in an SSTable, segments
-	// < walBoundary can be deleted.
+	// below it, so once the memtable is safely in an SSTable (and the MANIFEST
+	// says so) segments < walBoundary can be deleted.
 	walBoundary uint64
 }
 
@@ -59,54 +88,186 @@ type immutable struct {
 //
 // # Write path
 //
-//	command -> key stripe lock(s) -> read current state, decide, build ops
+//	command -> [stall if flush is behind] -> key stripe lock(s)
+//	        -> read current state, decide, build ops
 //	        -> wal.Commit (group commit: assign seq, write, fsync per policy)
 //	        -> [WAL leader, in log order] insert into active memtable
 //	        -> publish visible seq -> maybe seal memtable -> ack client
 //
 // # Read path
 //
-// A reader loads the published `visible` sequence number as its snapshot, then
-// searches the active memtable and the immutable memtables newest-first for the
-// newest version with seq <= snapshot. Because `visible` only advances after a
-// whole batch is inserted, readers see multi-key batches atomically and never
-// see a write that is not yet durable.
+// A reader pins a view: the published `visible` sequence number as its
+// snapshot, the active and immutable memtables, and a reference-counted
+// version of the SSTable set. It searches memtable -> immutables (newest
+// first) -> L0 files (newest first) -> L1.. (one candidate file per level) for
+// the newest version with seq <= snapshot. Because `visible` only advances
+// after a whole batch is inserted, readers see multi-key batches atomically and
+// never see a write that is not yet durable.
+//
+// # Flush
+//
+// A background goroutine turns the oldest immutable memtable into an L0
+// SSTable (temp file, fsync, rename, directory fsync), records it in the
+// MANIFEST together with the WAL boundary, installs it into the in-memory
+// version, and only then deletes the WAL segments it covered.
 type DB struct {
 	opts Options
 	wal  *wal.WAL
+	mf   *manifest.Manifest
 
-	mu     sync.RWMutex // guards mem, imms, closed
+	mu     sync.RWMutex // guards mem, imms, cur, tables, closed
+	cond   *sync.Cond   // signalled when imms shrinks (writers waiting in stall)
 	mem    *memtable.Memtable
 	imms   []*immutable // newest first
+	cur    *version
+	tables map[uint64]*tableFile
 	closed bool
 
 	visible atomic.Uint64 // highest fully applied sequence number
 	kl      keyLocks
 
-	recovery   wal.RecoveryInfo
-	rotations  atomic.Uint64
-	rotateErrs atomic.Uint64
+	flushCh  chan struct{}
+	stopCh   chan struct{}
+	flushWG  sync.WaitGroup
+	tstats   sstable.Stats
+	recovery wal.RecoveryInfo
+	mrecover manifest.Info
+
+	rotations    atomic.Uint64
+	rotateErrs   atomic.Uint64
+	flushes      atomic.Uint64
+	flushErrs    atomic.Uint64
+	flushBytes   atomic.Uint64
+	flushNanos   atomic.Uint64
+	stallNanos   atomic.Uint64
+	stalls       atomic.Uint64
+	deletedFiles atomic.Uint64
 }
 
-// Open opens (creating if needed) the database in opts.Dir, replaying the WAL.
+func sstPath(dir string, num uint64) string {
+	return filepath.Join(dir, fmt.Sprintf("%06d.sst", num))
+}
+
+// Open opens (creating if needed) the database in opts.Dir.
+//
+// Recovery order matters:
+//  1. MANIFEST: which SSTables are live, and the WAL boundary (LogNumber).
+//  2. Open every live SSTable (a missing/corrupt live file is a hard error).
+//  3. Delete files the MANIFEST does not know (half-written flush outputs, tables
+//     replaced by a finished compaction whose deletion was interrupted).
+//  4. WAL: delete segments below LogNumber, replay the rest into the memtable,
+//     truncating a torn tail.
 func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 	opts.fill()
-	d := &DB{opts: opts, mem: memtable.New()}
+	d := &DB{
+		opts: opts, mem: memtable.New(),
+		tables:  map[uint64]*tableFile{},
+		flushCh: make(chan struct{}, 1), stopCh: make(chan struct{}),
+	}
+	d.cond = sync.NewCond(&d.mu)
+
+	mf, minfo, err := manifest.Open(opts.FS, opts.Dir, manifest.Options{RewriteThreshold: opts.ManifestMax})
+	if err != nil {
+		return nil, wal.RecoveryInfo{}, err
+	}
+	d.mf, d.mrecover = mf, minfo
+	state := mf.Current()
+
+	d.cur = &version{}
+	live := map[uint64]bool{}
+	for lvl := range state.Levels {
+		for _, fm := range state.Levels[lvl] {
+			tf, err := d.openTable(fm)
+			if err != nil {
+				d.closeTables()
+				mf.Close()
+				return nil, wal.RecoveryInfo{}, fmt.Errorf("live table %06d.sst (level %d): %w", fm.Num, lvl, err)
+			}
+			d.cur.levels[lvl] = append(d.cur.levels[lvl], tf)
+			tf.ref()
+			live[fm.Num] = true
+		}
+	}
+	d.cur.refs.Store(1)
+	if err := d.removeOrphans(live); err != nil {
+		d.closeTables()
+		mf.Close()
+		return nil, wal.RecoveryInfo{}, err
+	}
+
 	w, info, err := wal.Open(wal.Options{
 		FS: opts.FS, Dir: opts.Dir, Policy: opts.Sync, Interval: opts.SyncEvery,
 		GroupCommit: opts.GroupCommit, Logger: opts.Logger,
+		MinSegment: state.LogNumber, StartSeq: state.LastSeq,
+		AfterGroup: d.maybeRotate,
 	}, func(b *wal.Batch) error {
 		d.insert(b.Seq, b.Ops)
 		return nil
 	})
 	if err != nil {
+		d.closeTables()
+		mf.Close()
 		return nil, info, err
 	}
 	d.wal = w
 	d.recovery = info
-	d.visible.Store(info.LastSeq)
+	last := info.LastSeq
+	if state.LastSeq > last {
+		last = state.LastSeq
+	}
+	d.visible.Store(last)
+	d.emit(Event{Type: EventRecovery, Count: int64(info.Batches), Detail: fmt.Sprintf("tables=%d torn_tail=%v", d.cur.numFiles(), info.TornTail)})
+
+	d.flushWG.Add(1)
+	go d.flushLoop()
 	d.maybeRotate() // replay may have produced an over-threshold memtable
 	return d, info, nil
+}
+
+func (d *DB) openTable(fm manifest.FileMeta) (*tableFile, error) {
+	path := sstPath(d.opts.Dir, fm.Num)
+	r, err := sstable.Open(d.opts.FS, path, sstable.ReaderOptions{FileNum: fm.Num, Stats: &d.tstats})
+	if err != nil {
+		return nil, err
+	}
+	tf := &tableFile{meta: fm, r: r, path: path, db: d}
+	d.tables[fm.Num] = tf
+	return tf, nil
+}
+
+func (d *DB) closeTables() {
+	for _, t := range d.tables {
+		t.r.Close()
+	}
+}
+
+// removeOrphans deletes SSTable and temp files that the MANIFEST does not list.
+func (d *DB) removeOrphans(live map[uint64]bool) error {
+	names, err := d.opts.FS.List(d.opts.Dir)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, n := range names {
+		orphan := false
+		if strings.HasSuffix(n, ".sst.tmp") {
+			orphan = true
+		} else if strings.HasSuffix(n, ".sst") {
+			num, perr := strconv.ParseUint(strings.TrimSuffix(n, ".sst"), 10, 64)
+			orphan = perr == nil && !live[num]
+		}
+		if orphan {
+			if err := d.opts.FS.Remove(filepath.Join(d.opts.Dir, n)); err != nil {
+				return err
+			}
+			d.opts.Logger.Warn("removed orphan file", "file", n)
+			removed = true
+		}
+	}
+	if removed {
+		return d.opts.FS.SyncDir(d.opts.Dir)
+	}
+	return nil
 }
 
 // insert adds ops (first op has sequence number first) to the active memtable.
@@ -126,17 +287,31 @@ func (d *DB) commit(ops []wal.Op) error {
 	return d.wal.Commit(&wal.Batch{Ops: ops}, func(first uint64) {
 		d.insert(first, ops)
 		d.visible.Store(first + uint64(len(ops)) - 1)
-		d.maybeRotate()
+		// NOT rotating here: see wal.Options.AfterGroup.
 	})
 }
 
 // maybeRotate seals the active memtable if it has outgrown MemtableSize.
 // It runs on the WAL leader, so no other writer is inserting concurrently.
-func (d *DB) maybeRotate() {
+func (d *DB) maybeRotate() { d.rotate(false) }
+
+// rotate seals the active memtable if force or it is over the size threshold.
+func (d *DB) rotate(force bool) {
 	d.mu.RLock()
 	mem := d.mem
 	d.mu.RUnlock()
-	if mem.ApproxSize() < d.opts.MemtableSize {
+	if mem.Empty() || (!force && mem.ApproxSize() < d.opts.MemtableSize) {
+		return
+	}
+	// Safety invariant: sealing is only correct if every record written to the
+	// WAL so far has been applied to THIS memtable. Otherwise a record in the
+	// segment we are about to retire would live in the next memtable, and
+	// deleting the segment after this memtable's flush would lose it. Rotation
+	// is therefore only done at group boundaries (wal.Options.AfterGroup); if the
+	// invariant is ever violated we refuse to rotate rather than risk data.
+	if _, maxSeq := mem.SeqRange(); maxSeq != d.wal.LastSeq() {
+		d.rotateErrs.Add(1)
+		d.opts.Logger.Error("refusing to rotate: memtable does not cover the WAL", "mem_max_seq", maxSeq, "wal_last_seq", d.wal.LastSeq())
 		return
 	}
 	// 1. Seal the WAL segment (fsync) and start a new one. If this fails we
@@ -153,15 +328,219 @@ func (d *DB) maybeRotate() {
 	d.mem = memtable.New()
 	d.mu.Unlock()
 	d.rotations.Add(1)
-	d.opts.Logger.Debug("memtable sealed", "wal_boundary", boundary)
+	d.emit(Event{Type: EventMemtableSealed, Bytes: mem.ApproxSize(), Count: mem.Len()})
+	d.emit(Event{Type: EventWALRotated, File: boundary})
+	d.kickFlush()
 }
 
-// view captures a consistent read view: the snapshot sequence number plus the
-// memtables that contain everything up to it.
+func (d *DB) kickFlush() {
+	select {
+	case d.flushCh <- struct{}{}:
+	default:
+	}
+}
+
+// waitForRoom is the write stall: while the flush backlog is at its limit,
+// writers wait. It is called before a writer takes any key lock, so the flush
+// goroutine (which needs none) can always make progress and wake us.
+func (d *DB) waitForRoom() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return ErrClosed
+	}
+	if len(d.imms) < d.opts.MaxImmutables {
+		return nil
+	}
+	t0 := time.Now()
+	d.stalls.Add(1)
+	d.emit(Event{Type: EventWriteStall, Count: int64(len(d.imms)), Detail: "immutable memtable backlog"})
+	// sync.Cond has no timeout; a timer broadcasts so we can give up.
+	timer := time.AfterFunc(d.opts.StallTimeout, func() { d.mu.Lock(); d.cond.Broadcast(); d.mu.Unlock() })
+	defer timer.Stop()
+	for len(d.imms) >= d.opts.MaxImmutables && !d.closed {
+		if time.Since(t0) >= d.opts.StallTimeout {
+			d.stallNanos.Add(uint64(time.Since(t0)))
+			return ErrWriteStall
+		}
+		d.cond.Wait()
+	}
+	d.stallNanos.Add(uint64(time.Since(t0)))
+	if d.closed {
+		return ErrClosed
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------- flush
+
+func (d *DB) flushLoop() {
+	defer d.flushWG.Done()
+	var retry <-chan time.Time
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-d.flushCh:
+		case <-retry:
+		}
+		retry = nil
+		for {
+			ok, err := d.flushOne()
+			if err != nil {
+				d.flushErrs.Add(1)
+				d.opts.Logger.Error("memtable flush failed (will retry)", "err", err)
+				retry = time.After(500 * time.Millisecond)
+				break
+			}
+			if !ok {
+				break
+			}
+		}
+	}
+}
+
+// flushOne flushes the oldest immutable memtable. ok is false if none exist.
+func (d *DB) flushOne() (ok bool, err error) {
+	d.mu.RLock()
+	if len(d.imms) == 0 {
+		d.mu.RUnlock()
+		return false, nil
+	}
+	im := d.imms[len(d.imms)-1]
+	d.mu.RUnlock()
+
+	t0 := time.Now()
+	d.emit(Event{Type: EventFlushStart, Count: im.mt.Len(), Bytes: im.mt.ApproxSize()})
+
+	edit := &manifest.Edit{HasLogNumber: true, LogNumber: im.walBoundary}
+	_, maxSeq := im.mt.SeqRange()
+	edit.HasLastSeq, edit.LastSeq = true, maxSeq
+
+	var tf *tableFile
+	if !im.mt.Empty() {
+		if tf, err = d.writeTable(im.mt, 0); err != nil {
+			return false, err
+		}
+		edit.Added = []manifest.FileMeta{tf.meta}
+	}
+	// The table is complete and durable. Make it real: MANIFEST first.
+	if err := d.mf.LogAndApply(edit); err != nil {
+		if tf != nil {
+			tf.r.Close()
+			d.opts.FS.Remove(tf.path)
+		}
+		return false, err
+	}
+	// Install atomically with respect to readers: they see the memtable or
+	// the table, never neither.
+	d.mu.Lock()
+	old := d.cur
+	if tf != nil {
+		d.cur = old.next([]*tableFile{tf}, nil)
+		d.tables[tf.meta.Num] = tf
+	}
+	for i, x := range d.imms {
+		if x == im {
+			d.imms = append(d.imms[:i:i], d.imms[i+1:]...)
+			break
+		}
+	}
+	d.cond.Broadcast()
+	d.mu.Unlock()
+	if tf != nil {
+		old.unref()
+	}
+
+	// Only now are the WAL segments redundant.
+	if err := d.wal.RemoveBefore(im.walBoundary); err != nil {
+		d.opts.Logger.Warn("could not delete old WAL segments (will be removed at next start)", "err", err)
+	}
+	dur := time.Since(t0)
+	d.flushes.Add(1)
+	d.flushNanos.Add(uint64(dur))
+	if tf != nil {
+		d.flushBytes.Add(uint64(tf.meta.Size))
+	}
+	d.emit(Event{Type: EventFlushEnd, Nanos: int64(dur), Bytes: func() int64 {
+		if tf != nil {
+			return tf.meta.Size
+		}
+		return 0
+	}(), File: func() uint64 {
+		if tf != nil {
+			return tf.meta.Num
+		}
+		return 0
+	}()})
+	return true, nil
+}
+
+// writeTable writes the memtable as a new SSTable at `level`, crash-safely:
+// temp file -> fsync -> rename -> directory fsync. It returns the opened table.
+func (d *DB) writeTable(mt *memtable.Memtable, level int) (*tableFile, error) {
+	num := d.mf.NewFileNumber()
+	final := sstPath(d.opts.Dir, num)
+	tmp := final + ".tmp"
+	f, err := d.opts.FS.Create(tmp)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*tableFile, error) {
+		f.Close()
+		d.opts.FS.Remove(tmp)
+		return nil, err
+	}
+	w := sstable.NewWriter(f, sstable.WriterOptions{BlockSize: d.opts.BlockSize, BloomBitsPerKey: d.opts.BloomBits})
+	it := mt.NewIterator()
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		if err := w.Add(it.Entry()); err != nil {
+			return fail(err)
+		}
+	}
+	props, err := w.Finish() // includes fsync of the file
+	if err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		d.opts.FS.Remove(tmp)
+		return nil, err
+	}
+	if err := d.opts.FS.Rename(tmp, final); err != nil {
+		d.opts.FS.Remove(tmp)
+		return nil, err
+	}
+	if err := d.opts.FS.SyncDir(d.opts.Dir); err != nil {
+		return nil, err
+	}
+	fi, err := d.opts.FS.Stat(final)
+	if err != nil {
+		return nil, err
+	}
+	meta := manifest.FileMeta{
+		Num: num, Level: level, Size: fi.Size(),
+		Entries: props.NumEntries, Deletes: props.NumDeletes,
+		MinSeq: props.MinSeq, MaxSeq: props.MaxSeq,
+		Smallest: props.Smallest, Largest: props.Largest,
+	}
+	r, err := sstable.Open(d.opts.FS, final, sstable.ReaderOptions{FileNum: num, Stats: &d.tstats})
+	if err != nil {
+		return nil, err
+	}
+	d.emit(Event{Type: EventFileCreated, File: num, Level: level, Bytes: meta.Size, Count: int64(meta.Entries)})
+	return &tableFile{meta: meta, r: r, path: final, db: d}, nil
+}
+
+// ---------------------------------------------------------------- reads
+
+// view captures a consistent read view: the snapshot sequence number, the
+// memtables that contain everything up to it, and a pinned table version.
+// Callers must call release.
 type view struct {
 	snap uint64
 	mem  *memtable.Memtable
 	imms []*immutable
+	ver  *version
 	now  int64
 }
 
@@ -172,30 +551,33 @@ func (d *DB) view() (view, error) {
 	if d.closed {
 		return view{}, ErrClosed
 	}
-	return view{snap: snap, mem: d.mem, imms: d.imms, now: d.opts.Now()}, nil
+	d.cur.ref()
+	return view{snap: snap, mem: d.mem, imms: d.imms, ver: d.cur, now: d.opts.Now()}, nil
 }
+
+func (v *view) release() { v.ver.unref() }
 
 // lookup finds the newest version of key visible in v. found is false if the
 // key has never been written; the returned entry may be a tombstone or expired.
-func (v *view) lookup(key []byte) (iterator.Entry, bool) {
+func (v *view) lookup(key []byte) (iterator.Entry, bool, error) {
 	if e, ok := v.mem.Get(key, v.snap); ok {
-		return e, true
+		return e, true, nil
 	}
 	for _, im := range v.imms {
 		if e, ok := im.mt.Get(key, v.snap); ok {
-			return e, true
+			return e, true, nil
 		}
 	}
-	return iterator.Entry{}, false
+	return v.ver.get(key, v.snap)
 }
 
 // live returns the current live value of key.
-func (v *view) live(key []byte) (e iterator.Entry, ok bool) {
-	e, found := v.lookup(key)
-	if !found || e.Kind == iterator.KindDelete || e.Expired(v.now) {
-		return e, false
+func (v *view) live(key []byte) (e iterator.Entry, ok bool, err error) {
+	e, found, err := v.lookup(key)
+	if err != nil || !found || e.Kind == iterator.KindDelete || e.Expired(v.now) {
+		return e, false, err
 	}
-	return e, true
+	return e, true, nil
 }
 
 func (d *DB) Get(key []byte) ([]byte, bool, error) {
@@ -203,9 +585,10 @@ func (d *DB) Get(key []byte) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	e, ok := v.live(key)
-	if !ok {
-		return nil, false, nil
+	defer v.release()
+	e, ok, err := v.live(key)
+	if err != nil || !ok {
+		return nil, false, err
 	}
 	return clone(e.Value), true, nil
 }
@@ -216,10 +599,15 @@ func (d *DB) MGet(keys [][]byte) ([][]byte, []bool, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	defer v.release()
 	vals := make([][]byte, len(keys))
 	found := make([]bool, len(keys))
 	for i, k := range keys {
-		if e, ok := v.live(k); ok {
+		e, ok, err := v.live(k)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ok {
 			vals[i], found[i] = clone(e.Value), true
 		}
 	}
@@ -231,8 +619,9 @@ func (d *DB) Exists(key []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, ok := v.live(key)
-	return ok, nil
+	defer v.release()
+	_, ok, err := v.live(key)
+	return ok, err
 }
 
 func (d *DB) TTL(key []byte) (int64, error) {
@@ -240,8 +629,11 @@ func (d *DB) TTL(key []byte) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	e, ok := v.live(key)
+	defer v.release()
+	e, ok, err := v.live(key)
 	switch {
+	case err != nil:
+		return 0, err
 	case !ok:
 		return -2, nil
 	case e.ExpireAt == 0:
@@ -250,13 +642,35 @@ func (d *DB) TTL(key []byte) (int64, error) {
 	return e.ExpireAt - v.now, nil
 }
 
+// ---------------------------------------------------------------- writes
+
+// beginWrite stalls if needed, locks the keys' stripes and pins a fresh view.
+// The returned function releases both. The view is taken AFTER the locks so it
+// reflects every earlier write to these keys (each such write finished its
+// apply before releasing its stripe).
+func (d *DB) beginWrite(keys ...[]byte) (view, func(), error) {
+	if err := d.waitForRoom(); err != nil {
+		return view{}, nil, err
+	}
+	unlock := d.kl.lock(keys...)
+	v, err := d.view()
+	if err != nil {
+		unlock()
+		return view{}, nil, err
+	}
+	return v, func() { v.release(); unlock() }, nil
+}
+
 func (d *DB) Set(key, value []byte, opt SetOptions) (bool, error) {
-	if _, err := d.view(); err != nil {
+	v, done, err := d.beginWrite(key)
+	if err != nil {
 		return false, err
 	}
-	defer d.kl.lock(key)()
-	v, _ := d.view()
-	old, exists := v.live(key)
+	defer done()
+	old, exists, err := v.live(key)
+	if err != nil {
+		return false, err
+	}
 	if (opt.NX && exists) || (opt.XX && !exists) {
 		return false, nil
 	}
@@ -267,14 +681,11 @@ func (d *DB) Set(key, value []byte, opt SetOptions) (bool, error) {
 			exp = old.ExpireAt
 		}
 	}
-	err := d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: value, ExpireAt: exp}})
+	err = d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: value, ExpireAt: exp}})
 	return err == nil, err
 }
 
 func (d *DB) MSet(pairs [][]byte) error {
-	if _, err := d.view(); err != nil {
-		return err
-	}
 	keys := make([][]byte, 0, len(pairs)/2)
 	ops := make([]wal.Op, 0, len(pairs)/2)
 	for i := 0; i+1 < len(pairs); i += 2 {
@@ -284,16 +695,20 @@ func (d *DB) MSet(pairs [][]byte) error {
 	if len(ops) == 0 {
 		return nil
 	}
-	defer d.kl.lock(keys...)()
+	_, done, err := d.beginWrite(keys...)
+	if err != nil {
+		return err
+	}
+	defer done()
 	return d.commit(ops)
 }
 
 func (d *DB) Del(keys [][]byte) (int, error) {
-	if _, err := d.view(); err != nil {
+	v, done, err := d.beginWrite(keys...)
+	if err != nil {
 		return 0, err
 	}
-	defer d.kl.lock(keys...)()
-	v, _ := d.view()
+	defer done()
 	var ops []wal.Op
 	seen := map[string]bool{}
 	for _, k := range keys {
@@ -301,7 +716,11 @@ func (d *DB) Del(keys [][]byte) (int, error) {
 			continue
 		}
 		seen[string(k)] = true
-		if _, ok := v.live(k); ok {
+		_, ok, err := v.live(k)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
 			ops = append(ops, wal.Op{Type: wal.OpDelete, Key: k})
 		}
 	}
@@ -315,40 +734,43 @@ func (d *DB) Del(keys [][]byte) (int, error) {
 }
 
 func (d *DB) SetExpiry(key []byte, atMs int64) (bool, error) {
-	if _, err := d.view(); err != nil {
+	v, done, err := d.beginWrite(key)
+	if err != nil {
 		return false, err
 	}
-	defer d.kl.lock(key)()
-	v, _ := d.view()
-	e, ok := v.live(key)
-	if !ok {
-		return false, nil
+	defer done()
+	e, ok, err := v.live(key)
+	if err != nil || !ok {
+		return false, err
 	}
-	err := d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: e.Value, ExpireAt: atMs}})
+	err = d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: e.Value, ExpireAt: atMs}})
 	return err == nil, err
 }
 
 func (d *DB) Persist(key []byte) (bool, error) {
-	if _, err := d.view(); err != nil {
+	v, done, err := d.beginWrite(key)
+	if err != nil {
 		return false, err
 	}
-	defer d.kl.lock(key)()
-	v, _ := d.view()
-	e, ok := v.live(key)
-	if !ok || e.ExpireAt == 0 {
-		return false, nil
+	defer done()
+	e, ok, err := v.live(key)
+	if err != nil || !ok || e.ExpireAt == 0 {
+		return false, err
 	}
-	err := d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: e.Value}})
+	err = d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: e.Value}})
 	return err == nil, err
 }
 
 func (d *DB) IncrBy(key []byte, delta int64) (int64, error) {
-	if _, err := d.view(); err != nil {
+	v, done, err := d.beginWrite(key)
+	if err != nil {
 		return 0, err
 	}
-	defer d.kl.lock(key)()
-	v, _ := d.view()
-	e, ok := v.live(key)
+	defer done()
+	e, ok, err := v.live(key)
+	if err != nil {
+		return 0, err
+	}
 	var cur int64
 	if ok {
 		n, err := strconv.ParseInt(string(e.Value), 10, 64)
@@ -371,12 +793,13 @@ func (d *DB) IncrBy(key []byte, delta int64) (int64, error) {
 	return cur, nil
 }
 
-// newMerged builds the merged version iterator over the view's memtables.
+// newMerged builds the merged version iterator over the view's memtables and tables.
 func (v *view) newMerged() *iterator.Merge {
 	children := []iterator.Iterator{v.mem.NewIterator()}
 	for _, im := range v.imms {
 		children = append(children, im.mt.NewIterator())
 	}
+	children = append(children, v.ver.iterators()...)
 	return iterator.NewMerge(children)
 }
 
@@ -385,6 +808,7 @@ func (d *DB) Scan(start []byte, limit int) ([][]byte, []byte, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	defer v.release() // the pinned version outlives the iterator below
 	if limit < 1 {
 		limit = 1
 	}
@@ -407,17 +831,23 @@ func (d *DB) Scan(start []byte, limit int) ([][]byte, []byte, error) {
 }
 
 // ApproxSize estimates the number of live keys as (puts - tombstones) across
-// the memtables. It over-counts overwritten and expired keys and (once
-// SSTables exist) data below the memtables; computing the exact number would
-// need a full merge. DBSIZE is documented as approximate for this reason.
+// memtables and tables. It over-counts overwritten and expired keys; computing
+// the exact number would need a full merge. DBSIZE is documented as
+// approximate for this reason.
 func (d *DB) ApproxSize() (int64, error) {
 	v, err := d.view()
 	if err != nil {
 		return 0, err
 	}
+	defer v.release()
 	n := v.mem.Len() - 2*v.mem.Tombstones()
 	for _, im := range v.imms {
 		n += im.mt.Len() - 2*im.mt.Tombstones()
+	}
+	for _, l := range v.ver.levels {
+		for _, f := range l {
+			n += int64(f.meta.Entries) - 2*int64(f.meta.Deletes)
+		}
 	}
 	if n < 0 {
 		n = 0
@@ -433,11 +863,15 @@ const flushChunk = 10000
 // keys deleted. (A single range-tombstone record would be atomic; deliberately
 // not implemented — FLUSHDB is an administrative command.)
 func (d *DB) Flush() error {
-	if _, err := d.view(); err != nil {
+	if err := d.waitForRoom(); err != nil {
 		return err
 	}
 	defer d.kl.lockAll()()
-	v, _ := d.view()
+	v, err := d.view()
+	if err != nil {
+		return err
+	}
+	defer v.release()
 	it := iterator.NewView(v.newMerged(), v.snap, v.now)
 	defer it.Close()
 	var ops []wal.Op
@@ -459,12 +893,55 @@ func (d *DB) Flush() error {
 	return nil
 }
 
+// ---------------------------------------------------------------- admin
+
+// WaitForFlush blocks until no immutable memtables remain (tests, graceful
+// maintenance). It returns an error if the DB is closed first.
+func (d *DB) WaitForFlush() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for len(d.imms) > 0 && !d.closed {
+		d.kickFlush()
+		d.cond.Wait()
+	}
+	if d.closed {
+		return ErrClosed
+	}
+	return nil
+}
+
+// FlushMemtable seals the active memtable (even if small) and waits until it
+// is on disk. Used by tests and `nebula compact`.
+func (d *DB) FlushMemtable() error {
+	// Rotation must not race with memtable inserts, which only happen on the
+	// WAL group leader; a barrier runs on that leader in log order.
+	if err := d.wal.Barrier(func() { d.rotate(true) }); err != nil {
+		return err
+	}
+	return d.WaitForFlush()
+}
+
+// Levels reports (file count, bytes) per level for INFO/metrics.
+func (d *DB) Levels() (files [manifest.NumLevels]int, bytes [manifest.NumLevels]int64) {
+	d.mu.RLock()
+	cur := d.cur
+	d.mu.RUnlock()
+	for i, l := range cur.levels {
+		files[i] = len(l)
+		for _, f := range l {
+			bytes[i] += f.meta.Size
+		}
+	}
+	return
+}
+
 func (d *DB) Stats() []Stat {
 	d.mu.RLock()
-	mem, imms := d.mem, d.imms
+	mem, imms, cur := d.mem, d.imms, d.cur
 	d.mu.RUnlock()
 	ws := d.wal.Stats()
 	u := func(n uint64) string { return strconv.FormatUint(n, 10) }
+	files, bytes := d.Levels()
 	st := []Stat{
 		{"engine", "lsm"},
 		{"last_seq", u(d.visible.Load())},
@@ -472,6 +949,18 @@ func (d *DB) Stats() []Stat {
 		{"memtable_entries", strconv.FormatInt(mem.Len(), 10)},
 		{"immutable_memtables", strconv.Itoa(len(imms))},
 		{"memtable_rotations", u(d.rotations.Load())},
+		{"rotation_errors", u(d.rotateErrs.Load())},
+		{"flushes", u(d.flushes.Load())},
+		{"flush_errors", u(d.flushErrs.Load())},
+		{"flush_bytes", u(d.flushBytes.Load())},
+		{"flush_seconds", fmt.Sprintf("%.3f", float64(d.flushNanos.Load())/1e9)},
+		{"write_stalls", u(d.stalls.Load())},
+		{"write_stall_seconds", fmt.Sprintf("%.3f", float64(d.stallNanos.Load())/1e9)},
+		{"table_files", strconv.Itoa(cur.numFiles())},
+		{"bloom_checked", u(d.tstats.BloomChecked.Load())},
+		{"bloom_skipped", u(d.tstats.BloomSkipped.Load())},
+		{"bloom_false_positive", u(d.tstats.BloomFalsePositive.Load())},
+		{"block_reads", u(d.tstats.BlockReads.Load())},
 		{"wal_segment", u(d.wal.ActiveSegment())},
 		{"wal_active_bytes", strconv.FormatInt(d.wal.Size(), 10)},
 		{"wal_bytes_written", u(ws.Bytes)},
@@ -482,6 +971,12 @@ func (d *DB) Stats() []Stat {
 		{"recovery_batches", strconv.Itoa(d.recovery.Batches)},
 		{"recovery_torn_tail", strconv.FormatBool(d.recovery.TornTail)},
 		{"recovery_truncated_bytes", strconv.FormatInt(d.recovery.TruncatedBytes, 10)},
+		{"manifest_number", u(d.mf.Number())},
+	}
+	for i := range files {
+		if files[i] > 0 {
+			st = append(st, Stat{fmt.Sprintf("level%d", i), fmt.Sprintf("files=%d,bytes=%d", files[i], bytes[i])})
+		}
 	}
 	if err := d.wal.Err(); err != nil {
 		st = append(st, Stat{"wal_failed", fmt.Sprint(err)})
@@ -489,7 +984,9 @@ func (d *DB) Stats() []Stat {
 	return st
 }
 
-// Close syncs and closes the WAL. Callers must have stopped issuing writes.
+// Close stops background work, syncs and closes the WAL, MANIFEST and tables.
+// Callers must have stopped issuing operations. Unflushed memtable contents are
+// not written to SSTables: they are recovered from the WAL on the next Open.
 func (d *DB) Close() error {
 	d.mu.Lock()
 	if d.closed {
@@ -497,8 +994,19 @@ func (d *DB) Close() error {
 		return nil
 	}
 	d.closed = true
+	d.cond.Broadcast()
 	d.mu.Unlock()
-	return d.wal.Close()
+	close(d.stopCh)
+	d.flushWG.Wait()
+
+	err := d.wal.Close()
+	if merr := d.mf.Close(); err == nil {
+		err = merr
+	}
+	d.mu.Lock()
+	d.closeTables()
+	d.mu.Unlock()
+	return err
 }
 
 var (
