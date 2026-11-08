@@ -79,3 +79,10 @@ type Engine interface {
 	// Close flushes and releases resources.
 	Close() error
 }
+
+// MultiGetter is an optional Engine capability: read several keys from ONE
+// consistent snapshot, so a concurrent multi-key write (MSET) is seen either
+// entirely or not at all. The server's MGET uses it when available.
+type MultiGetter interface {
+	MGet(keys [][]byte) (values [][]byte, found []bool, err error)
+}

@@ -278,17 +278,25 @@ func cmdPersist(s *Server, w *resp.Writer, a [][]byte) {
 }
 
 func cmdMGet(s *Server, w *resp.Writer, a [][]byte) {
-	// Collect first so an engine error yields a single clean error reply
-	// rather than a half-written array.
-	vals := make([][]byte, len(a)-1)
-	found := make([]bool, len(a)-1)
-	for i, k := range a[1:] {
-		v, ok, err := s.eng.Get(k)
-		if err != nil {
-			engErr(w, err)
-			return
+	keys := a[1:]
+	vals := make([][]byte, len(keys))
+	found := make([]bool, len(keys))
+	var err error
+	if mg, ok := s.eng.(engine.MultiGetter); ok {
+		// One snapshot for all keys: MGET never observes half of an MSET.
+		vals, found, err = mg.MGet(keys)
+	} else {
+		for i, k := range keys {
+			if vals[i], found[i], err = s.eng.Get(k); err != nil {
+				break
+			}
 		}
-		vals[i], found[i] = v, ok
+	}
+	// Reply only after all reads succeeded, so an engine error yields one clean
+	// error rather than a half-written array.
+	if err != nil {
+		engErr(w, err)
+		return
 	}
 	w.ArrayHeader(len(vals))
 	for i := range vals {

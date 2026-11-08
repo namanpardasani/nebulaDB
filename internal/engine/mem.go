@@ -14,8 +14,6 @@ type memEntry struct {
 	expireAt int64
 }
 
-const numStripes = 256
-
 // Mem is a map-backed Engine. With WAL options (OpenMem) it is *durable*: every
 // mutation is logged and made durable per the fsync policy before it is applied
 // and acknowledged, and the map is rebuilt from the log on restart. It is the
@@ -41,8 +39,8 @@ type Mem struct {
 	wal  *wal.WAL     // nil => volatile
 	stat struct{ recovered wal.RecoveryInfo }
 
-	stripes [numStripes]sync.Mutex
-	closed  bool
+	kl     keyLocks
+	closed bool
 }
 
 // NewMem returns an empty volatile engine using the wall clock.
@@ -77,48 +75,6 @@ func OpenMem(o MemOptions) (*Mem, wal.RecoveryInfo, error) {
 	m.wal = w
 	m.stat.recovered = info
 	return m, info, nil
-}
-
-func stripeOf(key []byte) int {
-	h := uint32(2166136261) // FNV-1a
-	for _, c := range key {
-		h = (h ^ uint32(c)) * 16777619
-	}
-	return int(h % numStripes)
-}
-
-// lockKeys locks the stripes covering keys (ascending, de-duplicated) and
-// returns the unlock function.
-func (m *Mem) lockKeys(keys ...[]byte) func() {
-	idx := make([]int, 0, len(keys))
-	seen := map[int]bool{}
-	for _, k := range keys {
-		s := stripeOf(k)
-		if !seen[s] {
-			seen[s] = true
-			idx = append(idx, s)
-		}
-	}
-	sort.Ints(idx)
-	for _, s := range idx {
-		m.stripes[s].Lock()
-	}
-	return func() {
-		for i := len(idx) - 1; i >= 0; i-- {
-			m.stripes[idx[i]].Unlock()
-		}
-	}
-}
-
-func (m *Mem) lockAll() func() {
-	for i := range m.stripes {
-		m.stripes[i].Lock()
-	}
-	return func() {
-		for i := len(m.stripes) - 1; i >= 0; i-- {
-			m.stripes[i].Unlock()
-		}
-	}
 }
 
 // applyOps updates the map. Called by the WAL leader after durability, and
@@ -186,7 +142,7 @@ func (m *Mem) Set(key, value []byte, opt SetOptions) (bool, error) {
 	if m.isClosed() {
 		return false, ErrClosed
 	}
-	defer m.lockKeys(key)()
+	defer m.kl.lock(key)()
 	old, exists := m.lookup(key)
 	if (opt.NX && exists) || (opt.XX && !exists) {
 		return false, nil
@@ -215,7 +171,7 @@ func (m *Mem) MSet(pairs [][]byte) error {
 	if len(ops) == 0 {
 		return nil
 	}
-	defer m.lockKeys(keys...)()
+	defer m.kl.lock(keys...)()
 	return m.commit(ops) // one WAL record => all-or-nothing across a crash
 }
 
@@ -223,7 +179,7 @@ func (m *Mem) Del(keys [][]byte) (int, error) {
 	if m.isClosed() {
 		return 0, ErrClosed
 	}
-	defer m.lockKeys(keys...)()
+	defer m.kl.lock(keys...)()
 	var ops []wal.Op
 	seen := map[string]bool{}
 	for _, k := range keys {
@@ -258,7 +214,7 @@ func (m *Mem) SetExpiry(key []byte, atMs int64) (bool, error) {
 	if m.isClosed() {
 		return false, ErrClosed
 	}
-	defer m.lockKeys(key)()
+	defer m.kl.lock(key)()
 	e, ok := m.lookup(key)
 	if !ok {
 		return false, nil
@@ -271,7 +227,7 @@ func (m *Mem) Persist(key []byte) (bool, error) {
 	if m.isClosed() {
 		return false, ErrClosed
 	}
-	defer m.lockKeys(key)()
+	defer m.kl.lock(key)()
 	e, ok := m.lookup(key)
 	if !ok || e.expireAt == 0 {
 		return false, nil
@@ -300,7 +256,7 @@ func (m *Mem) IncrBy(key []byte, delta int64) (int64, error) {
 	if m.isClosed() {
 		return 0, ErrClosed
 	}
-	defer m.lockKeys(key)()
+	defer m.kl.lock(key)()
 	e, ok := m.lookup(key)
 	var cur int64
 	if ok {
@@ -369,7 +325,7 @@ func (m *Mem) Flush() error {
 	if m.isClosed() {
 		return ErrClosed
 	}
-	defer m.lockAll()()
+	defer m.kl.lockAll()()
 	m.mu.RLock()
 	ops := make([]wal.Op, 0, len(m.m))
 	for k := range m.m {
