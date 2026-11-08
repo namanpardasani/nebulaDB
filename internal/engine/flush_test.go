@@ -364,3 +364,115 @@ func counterOf(v string) int {
 	fmt.Sscanf(v[i+1:], "%d", &n)
 	return n
 }
+
+func TestBlockCacheAndBloomInEngine(t *testing.T) {
+	dir := t.TempDir()
+	clk := enginetest.NewClock()
+	o := dbOpts(vfs.Default, dir, clk, 32<<10, wal.SyncNever)
+	o.BloomBits = 10
+	d := openDB(t, o)
+	defer d.Close()
+	want := fillKeys(t, d, 3000, 80)
+	d.FlushMemtable()
+	if stat(d, "table_files") == "0" {
+		t.Fatal("no tables")
+	}
+	// Read the same hot keys repeatedly: the first pass misses, the rest hit.
+	hot := []string{"key000010", "key001500", "key002900"}
+	for round := 0; round < 50; round++ {
+		for _, k := range hot {
+			if v, ok, _ := d.Get([]byte(k)); !ok || string(v) != want[k] {
+				t.Fatalf("hot key %s wrong", k)
+			}
+		}
+	}
+	hits, misses := stat(d, "block_cache_hits"), stat(d, "block_cache_misses")
+	t.Logf("cache hits=%s misses=%s hit_rate=%s block_reads=%s", hits, misses, stat(d, "block_cache_hit_rate"), stat(d, "block_reads"))
+	if hits == "0" {
+		t.Fatal("block cache never hit on repeated reads")
+	}
+	// Absent keys inside table key ranges are rejected by the Bloom filter
+	// without reading blocks.
+	before := stat(d, "block_reads")
+	for i := 0; i < 2000; i++ {
+		d.Get([]byte(fmt.Sprintf("key%06dx", i))) // in range, never written
+	}
+	skipped, checked, fp := stat(d, "bloom_skipped"), stat(d, "bloom_checked"), stat(d, "bloom_false_positive")
+	t.Logf("bloom: checked=%s skipped=%s false_positives=%s; block reads for 2000 absent lookups: %s -> %s", checked, skipped, fp, before, stat(d, "block_reads"))
+	if skipped == "0" {
+		t.Fatal("bloom filter never skipped a table")
+	}
+}
+
+// SCAN must merge duplicates, shadowing and tombstones correctly across the
+// memtable and many overlapping L0 tables, and paging must neither skip nor
+// repeat keys.
+func TestScanAcrossTablesAndMemtable(t *testing.T) {
+	dir := t.TempDir()
+	clk := enginetest.NewClock()
+	o := dbOpts(vfs.Default, dir, clk, 1<<20, wal.SyncNever) // big: flush only when we ask
+	d := openDB(t, o)
+	defer d.Close()
+	rng := rand.New(rand.NewSource(11))
+	oracle := map[string]string{}
+	for round := 0; round < 6; round++ {
+		for i := 0; i < 300; i++ {
+			k := fmt.Sprintf("k%04d", rng.Intn(500))
+			switch rng.Intn(4) {
+			case 0:
+				d.Del([][]byte{[]byte(k)})
+				delete(oracle, k)
+			default:
+				v := fmt.Sprintf("r%d-%d", round, i)
+				d.Set([]byte(k), []byte(v), engine.SetOptions{})
+				oracle[k] = v
+			}
+		}
+		if round < 5 {
+			if err := d.FlushMemtable(); err != nil { // rounds 0-4 become overlapping L0 tables; round 5 stays in the memtable
+				t.Fatal(err)
+			}
+		}
+	}
+	if stat(d, "table_files") != "5" {
+		t.Fatalf("want 5 tables, have %s", stat(d, "table_files"))
+	}
+	for _, page := range []int{1, 7, 64, 100000} {
+		var got []string
+		var next []byte
+		for {
+			keys, n, err := d.Scan(next, page)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, k := range keys {
+				got = append(got, string(k))
+			}
+			if n == nil {
+				break
+			}
+			next = n
+		}
+		var want []string
+		for k := range oracle {
+			want = append(want, k)
+		}
+		sortStrings(want)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("page=%d: scan differs from oracle (got %d keys, want %d)", page, len(got), len(want))
+		}
+	}
+	for k, v := range oracle {
+		if got, ok, _ := d.Get([]byte(k)); !ok || string(got) != v {
+			t.Fatalf("%s: got %q ok=%v want %q", k, got, ok, v)
+		}
+	}
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
+}

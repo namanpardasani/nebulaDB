@@ -39,6 +39,9 @@ func (t *tableFile) unref() {
 		if err := t.db.opts.FS.Remove(t.path); err == nil {
 			t.db.deletedFiles.Add(1)
 		}
+		if t.db.cache != nil {
+			t.db.cache.EvictFile(t.meta.Num)
+		}
 		t.db.mu.Lock()
 		delete(t.db.tables, t.meta.Num)
 		t.db.mu.Unlock()

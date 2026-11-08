@@ -67,6 +67,8 @@ Record = len u32 | crc32c u32 | edit. Edit = tagged varints: logNumber, nextFile
 - (P5) Backpressure v1: writers stall (sync.Cond) while `len(immutables) >= MaxImmutables` (default 2); give up with ErrWriteStall after StallTimeout (30s) so a dead disk cannot hang clients. L0-count based slowdown/stop comes with compaction in Phase 7.
 - (P5) Missing live table or CURRENT-less dir with .sst files => refuse to start (never silently drop data). Corrupt data block => read returns an error (SSTable CRCs), never wrong data.
 - (P5) Close() does not flush the active memtable: WAL replay recovers it. Open file descriptors: all live tables stay open (fd cache is a later refinement).
+- (P6) Block cache: 16-shard byte-bounded LRU keyed by (fileNum, offset); cached blocks are immutable so iterators need no pinning (GC keeps an evicted block alive while held); table deletion calls EvictFile. Default 32 MiB in the engine, `-cache-size` flag (0 disables). Tradeoff: a strict LRU `Get` mutates the recency list, so each shard's mutex serialises its readers; CLOCK/sampled-LRU would scale better under heavy read parallelism (possible future work, not needed so far).
+- (P6) Perf finding: global atomic hit/miss counters were the bottleneck of parallel cache reads (BenchmarkGetHitParallel 67.6 -> ~51 ns/op after moving counters into the shard's critical section; numbers from the machine below).
 - Commit policy (user request): no Claude/Co-Authored-By attribution in commits.
 - Module path `github.com/naman/nebuladb` (local only; no remote). Go 1.27.3 toolchain on dev machine.
 - All I/O goes through `internal/vfs` (added to the layout; not in the brief's list). `Faulty` wraps any FS and supports: rule-based errors (skip N, fail M, sticky), torn/short writes (`Partial`), ENOSPC via a disk-size cap, read-time bit flips, and `Crash()` power-loss simulation. Crash drops unsynced file bytes (or keeps a random torn prefix) AND undoes create/rename/remove that were never made durable with `SyncDir` (backing up overwritten content to restore it). This is adversarial on purpose: it is what proves the temp-file + fsync + rename + dir-fsync recipe (`vfs.WriteFileAtomic`) is needed.
@@ -82,6 +84,11 @@ Machine: 11th Gen Intel i7-1165G7 @ 2.80GHz, 8 threads, WSL2 Linux, Go 1.27.3. K
 - BenchmarkGet: 1945 ns/op, 0 allocs (100k keys, single goroutine)
 - BenchmarkGetParallel: 258.9 ns/op (8 goroutines, lock-free reads)
 Phase 10 will re-run these properly (multiple counts, benchstat).
+### Phase 6 measurements (same machine; go test output, unit-test scale, not final benchmarks)
+- Bloom false-positive rate, 20k keys, 200k absent probes (`TestFalsePositiveRate`): 6 bits/key 5.67% (theory 5.61%); 8 bits 2.15% (2.16%); 10 bits 0.756% (0.819%); 12 bits 0.323% (0.314%); 16 bits 0.040% (0.046%).
+- Engine-level (3000 keys, 10 bits/key, 8 tables): 2141 filter checks, 1968 tables skipped without I/O, 23 false positives (1.07% of checks); 50 rounds of repeated hot-key reads: 147 cache hits / 3 misses (98.0% hit rate), 3 block reads.
+- Prefix compression: 2000 keys with a 36-byte common prefix: 24,492 data bytes (restart every 16) vs 118,134 (restart every entry).
+- BenchmarkGetHit (block cache, 1000 blocks): ~38-40 ns/op serial, ~50-56 ns/op with 8 parallel goroutines (3 runs each). BloomMayContain: 36.6 ns/op.
 
 ## Bugs found by tests
 ### 1. Skip list returned a version newer than the reader's snapshot (Phase 4)
@@ -117,4 +124,6 @@ Phase 10 will re-run these properly (multiple counts, benchstat).
   KNOWN ISSUES: origin push still pending (see Phase 2 note). Immutable memtables accumulate until Phase 5 flush.
 - Phase 5 DONE: internal/bloom (measured FP rates match theory), internal/sstable (blocks, prefix compression, sparse index, filter, footer, reader/iterator, Verify), internal/manifest (edits, CURRENT, torn-tail repair, snapshot rewrite), engine: versions with refcounts, flush worker, crash-safe startup, orphan cleanup, write stall, events hook. Tests: 100% of truncations and single-byte flips of an SSTable detected, 4 fuzz targets (sstable x2, manifest x2, bloom, wal) run clean, flush failure at 5 stages, write stall + resume, 25 random-moment power-loss rounds with concurrent flush (0 acked writes lost), kill -9 + redis-cli check. 3 bugs found (see above). build/vet/`go test -race ./...` clean.
   KNOWN ISSUES: origin push still pending (force-push approval needed, see Phase 2 note). L0 files accumulate until Phase 7 compaction (reads check every L0 file whose key range matches). Block cache not yet wired (Phase 6).
-  Next: Phase 6 (block cache, SCAN polish, Bloom stats in INFO, iterator tests over tables).
+- Phase 6 DONE: sharded LRU block cache (+tests, benchmarks), cache and Bloom stats in INFO, Bloom FP rate measured vs theory, iterator Merge/View proven over memtable + overlapping L0 tables (SCAN with page sizes 1/7/64/all matches an oracle, tombstones and overwrites across tables), engine cache/bloom integration test. build/vet/`go test -race ./...` clean.
+  KNOWN ISSUES: origin push pending (force-push approval). No compaction yet: L0 grows; Phase 7 next.
+  Next: Phase 7 (leveled + size-tiered compaction, L0 slowdown/stop backpressure, snapshot/iterator pinning tests).

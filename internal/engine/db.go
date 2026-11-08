@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/naman/nebuladb/internal/cache"
 	"github.com/naman/nebuladb/internal/iterator"
 	"github.com/naman/nebuladb/internal/manifest"
 	"github.com/naman/nebuladb/internal/memtable"
@@ -42,6 +43,10 @@ type Options struct {
 	// StallTimeout bounds how long a writer waits for flush progress. Default 30s.
 	StallTimeout time.Duration
 
+	// BlockCacheBytes sizes the SSTable block cache: 0 = default (32 MiB),
+	// negative = disabled.
+	BlockCacheBytes int64
+
 	BlockSize   int // SSTable data block size (default 4096)
 	BloomBits   int // Bloom filter bits per key (0 disables; default set by caller)
 	ManifestMax int64
@@ -66,6 +71,9 @@ func (o *Options) fill() {
 	}
 	if o.BlockSize <= 0 {
 		o.BlockSize = 4 << 10
+	}
+	if o.BlockCacheBytes == 0 {
+		o.BlockCacheBytes = 32 << 20
 	}
 	if o.Now == nil {
 		o.Now = func() int64 { return time.Now().UnixMilli() }
@@ -126,6 +134,7 @@ type DB struct {
 	visible atomic.Uint64 // highest fully applied sequence number
 	kl      keyLocks
 
+	cache    *cache.Cache // nil when disabled
 	flushCh  chan struct{}
 	stopCh   chan struct{}
 	flushWG  sync.WaitGroup
@@ -165,6 +174,9 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 		flushCh: make(chan struct{}, 1), stopCh: make(chan struct{}),
 	}
 	d.cond = sync.NewCond(&d.mu)
+	if opts.BlockCacheBytes > 0 {
+		d.cache = cache.New(opts.BlockCacheBytes)
+	}
 
 	mf, minfo, err := manifest.Open(opts.FS, opts.Dir, manifest.Options{RewriteThreshold: opts.ManifestMax})
 	if err != nil {
@@ -224,9 +236,19 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 	return d, info, nil
 }
 
+// readerOpts builds reader options; the cache is only set when enabled (a nil
+// *cache.Cache stored in the interface would not be a nil interface).
+func (d *DB) readerOpts(num uint64) sstable.ReaderOptions {
+	ro := sstable.ReaderOptions{FileNum: num, Stats: &d.tstats}
+	if d.cache != nil {
+		ro.Cache = d.cache
+	}
+	return ro
+}
+
 func (d *DB) openTable(fm manifest.FileMeta) (*tableFile, error) {
 	path := sstPath(d.opts.Dir, fm.Num)
-	r, err := sstable.Open(d.opts.FS, path, sstable.ReaderOptions{FileNum: fm.Num, Stats: &d.tstats})
+	r, err := sstable.Open(d.opts.FS, path, d.readerOpts(fm.Num))
 	if err != nil {
 		return nil, err
 	}
@@ -523,7 +545,7 @@ func (d *DB) writeTable(mt *memtable.Memtable, level int) (*tableFile, error) {
 		MinSeq: props.MinSeq, MaxSeq: props.MaxSeq,
 		Smallest: props.Smallest, Largest: props.Largest,
 	}
-	r, err := sstable.Open(d.opts.FS, final, sstable.ReaderOptions{FileNum: num, Stats: &d.tstats})
+	r, err := sstable.Open(d.opts.FS, final, d.readerOpts(num))
 	if err != nil {
 		return nil, err
 	}
@@ -961,6 +983,8 @@ func (d *DB) Stats() []Stat {
 		{"bloom_skipped", u(d.tstats.BloomSkipped.Load())},
 		{"bloom_false_positive", u(d.tstats.BloomFalsePositive.Load())},
 		{"block_reads", u(d.tstats.BlockReads.Load())},
+		{"block_cache_hits", u(d.tstats.CacheHits.Load())},
+		{"block_cache_misses", u(d.tstats.CacheMisses.Load())},
 		{"wal_segment", u(d.wal.ActiveSegment())},
 		{"wal_active_bytes", strconv.FormatInt(d.wal.Size(), 10)},
 		{"wal_bytes_written", u(ws.Bytes)},
@@ -977,6 +1001,14 @@ func (d *DB) Stats() []Stat {
 		if files[i] > 0 {
 			st = append(st, Stat{fmt.Sprintf("level%d", i), fmt.Sprintf("files=%d,bytes=%d", files[i], bytes[i])})
 		}
+	}
+	if d.cache != nil {
+		cs := d.cache.Stats()
+		st = append(st,
+			Stat{"block_cache_bytes", strconv.FormatInt(cs.Bytes, 10)},
+			Stat{"block_cache_entries", strconv.FormatInt(cs.Entries, 10)},
+			Stat{"block_cache_evictions", u(cs.Evictions)},
+			Stat{"block_cache_hit_rate", fmt.Sprintf("%.4f", cs.HitRate())})
 	}
 	if err := d.wal.Err(); err != nil {
 		st = append(st, Stat{"wal_failed", fmt.Sprint(err)})
