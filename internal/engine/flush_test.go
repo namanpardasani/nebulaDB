@@ -477,3 +477,16 @@ func sortStrings(s []string) {
 		}
 	}
 }
+
+func TestDirectoryLockPreventsDoubleOpen(t *testing.T) {
+	dir := t.TempDir()
+	clk := enginetest.NewClock()
+	o := dbOpts(vfs.Default, dir, clk, 1<<20, wal.SyncNever)
+	d := openDB(t, o)
+	if _, _, err := engine.Open(o); err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("second Open on the same directory must fail, got %v", err)
+	}
+	d.Close()
+	d2 := openDB(t, o) // released by Close
+	d2.Close()
+}

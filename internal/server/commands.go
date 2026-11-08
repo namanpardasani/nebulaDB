@@ -67,11 +67,13 @@ const (
 func (s *Server) execute(w *resp.Writer, args [][]byte) bool {
 	name := strings.ToUpper(string(args[0]))
 	if name == "QUIT" {
+		s.m.perCmd["QUIT"].Inc()
 		w.OK()
 		return true
 	}
 	cmd, ok := commands[name]
 	if !ok {
+		s.m.unknown.Inc()
 		w.Error(fmt.Sprintf("ERR unknown command '%s'", truncate(string(args[0]), 64)))
 		return false
 	}
@@ -79,7 +81,10 @@ func (s *Server) execute(w *resp.Writer, args [][]byte) bool {
 		w.Error(fmt.Sprintf(errWrongOk, strings.ToLower(name)))
 		return false
 	}
+	s.m.perCmd[name].Inc()
+	t0 := time.Now()
 	cmd.fn(s, w, args)
+	s.m.latency[commandClass[name]].Observe(time.Since(t0))
 	return false
 }
 
@@ -435,7 +440,10 @@ func cmdInfo(s *Server, w *resp.Writer, _ [][]byte) {
 		Version, int64(time.Since(s.started).Seconds()))
 	fmt.Fprintf(&b, "\r\n# Clients\r\nconnected_clients:%d\r\ntotal_connections_received:%d\r\nrejected_connections:%d\r\n",
 		s.activeConns.Load(), s.totalConns.Load(), s.rejectedConns.Load())
-	fmt.Fprintf(&b, "\r\n# Stats\r\ntotal_commands_processed:%d\r\n", s.totalCmds.Load())
+	sn := s.Snapshot()
+	fmt.Fprintf(&b, "\r\n# Stats\r\ntotal_commands_processed:%d\r\ninstantaneous_ops_per_sec:%.0f\r\nunknown_commands:%d\r\n",
+		sn.TotalCommands, sn.OpsPerSec, sn.UnknownCmds)
+	fmt.Fprintf(&b, "\r\n# Latency (server-side command processing, bucketed estimates)\r\n%s", latencyReport(sn))
 	fmt.Fprintf(&b, "\r\n# Engine\r\n")
 	for _, st := range s.eng.Stats() {
 		fmt.Fprintf(&b, "%s:%s\r\n", st.Name, st.Value)

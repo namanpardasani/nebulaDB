@@ -375,3 +375,48 @@ func (it *Iter) Err() error            { return it.err }
 func (it *Iter) Close() error          { return nil }
 
 var _ iterator.Iterator = (*Iter)(nil)
+
+// SalvageResult describes a best-effort read of a possibly damaged table.
+type SalvageResult struct {
+	Blocks        int
+	BadBlocks     int
+	Entries       int
+	BadBlockInfos []string
+}
+
+// Salvage calls fn for every entry in every readable data block. A block with a
+// bad checksum or undecodable contents is skipped whole (its entries cannot be
+// trusted) and reported. The table must still have an intact footer and index
+// (Open succeeded). Entry slices passed to fn are only valid during the call.
+// Used by `nebula repair`.
+func (r *Reader) Salvage(fn func(iterator.Entry) error) (SalvageResult, error) {
+	var res SalvageResult
+	for bi, ie := range r.index {
+		res.Blocks++
+		blk, err := r.readBlockRaw(ie.handle)
+		var es []iterator.Entry
+		if err == nil {
+			var it *blockIter
+			if it, err = newBlockIter(blk); err == nil {
+				for it.first(); it.valid; it.step() {
+					e := it.entry()
+					e.Key = append([]byte(nil), e.Key...)
+					es = append(es, e)
+				}
+				err = it.err
+			}
+		}
+		if err != nil {
+			res.BadBlocks++
+			res.BadBlockInfos = append(res.BadBlockInfos, fmt.Sprintf("block %d at offset %d: %v", bi, ie.handle.offset, err))
+			continue
+		}
+		for _, e := range es {
+			if err := fn(e); err != nil {
+				return res, err
+			}
+			res.Entries++
+		}
+	}
+	return res, nil
+}

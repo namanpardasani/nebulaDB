@@ -240,3 +240,43 @@ func findValidRecord(data []byte, from int) int {
 	}
 	return -1
 }
+
+// SalvageResult describes a best-effort scan.
+type SalvageResult struct {
+	Batches      int
+	SkippedBytes int64 // bytes that did not belong to any valid record
+	Skipped      []Range
+}
+
+// Range is a byte range [Start, End) of a segment.
+type Range struct{ Start, End int64 }
+
+// SalvageSegment extracts every valid record from a possibly damaged segment.
+// Unlike ScanSegment it never refuses: at a bad record it searches forward for
+// the next valid one (resynchronising) and reports what was skipped. Records are
+// self-validating (length + CRC + structure), so a false resync would need a
+// CRC collision. Used by `nebula repair`; sequence numbers are not enforced.
+func SalvageSegment(data []byte, fn func(*Batch) error) (SalvageResult, error) {
+	var res SalvageResult
+	off := 0
+	for off < len(data) {
+		b, n, reason := decodeRecord(data[off:])
+		if reason == "" {
+			if err := fn(&b); err != nil {
+				return res, err
+			}
+			res.Batches++
+			off += n
+			continue
+		}
+		next := findValidRecord(data, off+1)
+		end := len(data)
+		if next >= 0 {
+			end = next
+		}
+		res.Skipped = append(res.Skipped, Range{int64(off), int64(end)})
+		res.SkippedBytes += int64(end - off)
+		off = end
+	}
+	return res, nil
+}

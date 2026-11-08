@@ -491,3 +491,46 @@ func TestCursorTableEviction(t *testing.T) {
 		t.Fatal("cursor id 0 is reserved")
 	}
 }
+
+func TestInfoLatencyAndCommandCounters(t *testing.T) {
+	ts := startServer(t, 0)
+	c := ts.dial(t)
+	for i := 0; i < 50; i++ {
+		c.do(t, "SET", fmt.Sprint("k", i), "v")
+		c.do(t, "GET", fmt.Sprint("k", i))
+	}
+	c.do(t, "NOSUCH")
+	info := string(c.do(t, "INFO").Str)
+	for _, want := range []string{"# Latency", "read_commands:50", "write_commands:50", "write_latency_p99_us:", "read_latency_p50_us:", "unknown_commands:1", "instantaneous_ops_per_sec:"} {
+		if !strings.Contains(info, want) {
+			t.Errorf("INFO missing %q:\n%s", want, info)
+		}
+	}
+	sn := ts.Snapshot()
+	if sn.PerCommand["SET"] != 50 || sn.PerCommand["GET"] != 50 || sn.Latency[ClassWrite].Count != 50 {
+		t.Fatalf("snapshot: %+v", sn.PerCommand)
+	}
+	// The ops/sec sampler converges under load.
+	deadline := time.Now().Add(3 * time.Second)
+	for ts.Snapshot().OpsPerSec == 0 && time.Now().Before(deadline) {
+		for i := 0; i < 200; i++ {
+			c.do(t, "PING")
+		}
+	}
+	if ts.Snapshot().OpsPerSec == 0 {
+		t.Fatal("ops/sec never became non-zero")
+	}
+}
+
+func TestExecInProcess(t *testing.T) {
+	ts := startServer(t, 0)
+	if v, err := ts.Exec([][]byte{[]byte("SET"), []byte("a"), []byte("1")}); err != nil || render(v) != "+OK" {
+		t.Fatalf("%v %v", render(v), err)
+	}
+	if v, _ := ts.Exec([][]byte{[]byte("GET"), []byte("a")}); render(v) != `"1"` {
+		t.Fatalf("%s", render(v))
+	}
+	if v, _ := ts.Exec([][]byte{[]byte("BOGUS")}); !strings.HasPrefix(render(v), "-ERR unknown") {
+		t.Fatalf("%s", render(v))
+	}
+}

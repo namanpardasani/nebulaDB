@@ -53,8 +53,10 @@ type Server struct {
 	closing bool
 	wg      sync.WaitGroup
 
-	cursors *cursorTable
-	started time.Time
+	cursors     *cursorTable
+	started     time.Time
+	m           *serverMetrics
+	stopSampler chan struct{}
 
 	// counters (also surfaced through INFO)
 	totalConns    atomic.Int64
@@ -66,13 +68,16 @@ type Server struct {
 // New creates a Server over eng.
 func New(eng engine.Engine, opt Options) *Server {
 	s := &Server{
-		eng:     eng,
-		log:     opt.Logger,
-		now:     opt.Now,
-		conns:   map[net.Conn]struct{}{},
-		cursors: newCursorTable(4096),
-		started: time.Now(),
+		eng:         eng,
+		log:         opt.Logger,
+		now:         opt.Now,
+		conns:       map[net.Conn]struct{}{},
+		cursors:     newCursorTable(4096),
+		started:     time.Now(),
+		m:           newServerMetrics(),
+		stopSampler: make(chan struct{}),
 	}
+	go s.sampleLoop(s.stopSampler)
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
@@ -179,6 +184,9 @@ func (s *Server) unregister(c net.Conn) {
 // force-closed. It does not close the Engine.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
+	if !s.closing {
+		close(s.stopSampler)
+	}
 	s.closing = true
 	ln := s.ln
 	conns := make([]net.Conn, 0, len(s.conns))

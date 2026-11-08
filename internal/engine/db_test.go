@@ -366,6 +366,7 @@ func TestDBCrashLosesNoAckedWrite(t *testing.T) {
 			d.Set([]byte("inflight"), []byte("x"), engine.SetOptions{}) // fails: never acked
 			fs.Crash(mode)
 			fs.ClearRules()
+			d.Close() // the "process" died: its directory lock is released
 
 			d2 := openDB(t, o)
 			for k, want := range acked {

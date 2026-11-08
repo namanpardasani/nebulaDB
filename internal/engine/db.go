@@ -172,6 +172,10 @@ type DB struct {
 	slowdowns      atomic.Uint64
 	slowdownNanos  atomic.Uint64
 	userBytes      atomic.Uint64 // key+value bytes accepted from clients
+
+	sampleCtr atomic.Uint64
+	samples   [sampleRing]atomic.Pointer[WriteSample]
+	unlock    func() // releases the directory LOCK
 }
 
 func sstPath(dir string, num uint64) string {
@@ -200,8 +204,17 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 		d.cache = cache.New(opts.BlockCacheBytes)
 	}
 
+	if err := opts.FS.MkdirAll(opts.Dir, 0o755); err != nil {
+		return nil, wal.RecoveryInfo{}, err
+	}
+	unlock, err := lockDir(opts.Dir)
+	if err != nil {
+		return nil, wal.RecoveryInfo{}, err
+	}
+	d.unlock = unlock
 	mf, minfo, err := manifest.Open(opts.FS, opts.Dir, manifest.Options{RewriteThreshold: opts.ManifestMax})
 	if err != nil {
+		unlock()
 		return nil, wal.RecoveryInfo{}, err
 	}
 	d.mf, d.mrecover = mf, minfo
@@ -215,6 +228,7 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 			if err != nil {
 				d.closeTables()
 				mf.Close()
+				unlock()
 				return nil, wal.RecoveryInfo{}, fmt.Errorf("live table %06d.sst (level %d): %w", fm.Num, lvl, err)
 			}
 			d.cur.levels[lvl] = append(d.cur.levels[lvl], tf)
@@ -227,6 +241,7 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 	if err := d.removeOrphans(live); err != nil {
 		d.closeTables()
 		mf.Close()
+		unlock()
 		return nil, wal.RecoveryInfo{}, err
 	}
 
@@ -242,6 +257,7 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 	if err != nil {
 		d.closeTables()
 		mf.Close()
+		unlock()
 		return nil, info, err
 	}
 	d.wal = w
@@ -339,6 +355,7 @@ func (d *DB) commit(ops []wal.Op) error {
 	d.userBytes.Add(n)
 	return d.wal.Commit(&wal.Batch{Ops: ops}, func(first uint64) {
 		d.insert(first, ops)
+		d.recordSample(first, ops[0].Key, len(ops[0].Value), ops[0].Type == wal.OpDelete)
 		d.visible.Store(first + uint64(len(ops)) - 1)
 		// NOT rotating here: see wal.Options.AfterGroup.
 	})
@@ -1037,72 +1054,71 @@ func (d *DB) Levels() (files [manifest.NumLevels]int, bytes [manifest.NumLevels]
 	return
 }
 
+// Stats renders the metrics as INFO lines.
 func (d *DB) Stats() []Stat {
-	d.mu.RLock()
-	mem, imms, cur := d.mem, d.imms, d.cur
-	d.mu.RUnlock()
-	ws := d.wal.Stats()
+	m := d.Metrics()
 	u := func(n uint64) string { return strconv.FormatUint(n, 10) }
-	files, bytes := d.Levels()
+	i := func(n int64) string { return strconv.FormatInt(n, 10) }
+	f3 := func(x float64) string { return fmt.Sprintf("%.3f", x) }
 	st := []Stat{
 		{"engine", "lsm"},
-		{"last_seq", u(d.visible.Load())},
-		{"memtable_bytes", strconv.FormatInt(mem.ApproxSize(), 10)},
-		{"memtable_entries", strconv.FormatInt(mem.Len(), 10)},
-		{"immutable_memtables", strconv.Itoa(len(imms))},
-		{"memtable_rotations", u(d.rotations.Load())},
+		{"last_seq", u(m.LastSeq)},
+		{"memtable_bytes", i(m.MemtableBytes)},
+		{"memtable_entries", i(m.MemtableEntries)},
+		{"immutable_memtables", strconv.Itoa(m.Immutables)},
+		{"memtable_rotations", u(m.Rotations)},
 		{"rotation_errors", u(d.rotateErrs.Load())},
-		{"flushes", u(d.flushes.Load())},
-		{"flush_errors", u(d.flushErrs.Load())},
-		{"flush_bytes", u(d.flushBytes.Load())},
-		{"flush_seconds", fmt.Sprintf("%.3f", float64(d.flushNanos.Load())/1e9)},
-		{"write_stalls", u(d.stalls.Load())},
-		{"write_stall_seconds", fmt.Sprintf("%.3f", float64(d.stallNanos.Load())/1e9)},
-		{"table_files", strconv.Itoa(cur.numFiles())},
-		{"l0_files", strconv.Itoa(len(cur.levels[0]))},
-		{"compactions", u(d.compactions.Load())},
-		{"compaction_errors", u(d.compactErrs.Load())},
-		{"compaction_bytes_read", u(d.compactRead.Load())},
-		{"compaction_bytes_written", u(d.compactWritten.Load())},
-		{"compaction_entries_dropped", u(d.compactDropped.Load())},
-		{"compaction_seconds", fmt.Sprintf("%.3f", float64(d.compactNanos.Load())/1e9)},
-		{"compaction_throttled_seconds", fmt.Sprintf("%.3f", float64(d.throttled.Load())/1e9)},
-		{"write_slowdowns", u(d.slowdowns.Load())},
-		{"user_bytes_written", u(d.userBytes.Load())},
-		{"write_amplification", fmt.Sprintf("%.2f", d.writeAmp())},
-		{"bloom_checked", u(d.tstats.BloomChecked.Load())},
-		{"bloom_skipped", u(d.tstats.BloomSkipped.Load())},
-		{"bloom_false_positive", u(d.tstats.BloomFalsePositive.Load())},
-		{"block_reads", u(d.tstats.BlockReads.Load())},
-		{"block_cache_hits", u(d.tstats.CacheHits.Load())},
-		{"block_cache_misses", u(d.tstats.CacheMisses.Load())},
-		{"wal_segment", u(d.wal.ActiveSegment())},
-		{"wal_active_bytes", strconv.FormatInt(d.wal.Size(), 10)},
-		{"wal_bytes_written", u(ws.Bytes)},
-		{"wal_batches", u(ws.Batches)},
-		{"wal_groups", u(ws.Groups)},
-		{"wal_fsyncs", u(ws.Syncs)},
-		{"wal_max_group", u(ws.MaxGroup)},
-		{"recovery_batches", strconv.Itoa(d.recovery.Batches)},
-		{"recovery_torn_tail", strconv.FormatBool(d.recovery.TornTail)},
-		{"recovery_truncated_bytes", strconv.FormatInt(d.recovery.TruncatedBytes, 10)},
-		{"manifest_number", u(d.mf.Number())},
+		{"flushes", u(m.Flushes)},
+		{"flush_errors", u(m.FlushErrors)},
+		{"flush_bytes", u(m.FlushBytes)},
+		{"flush_seconds", f3(m.FlushSeconds)},
+		{"write_stalls", u(m.WriteStalls)},
+		{"write_stall_seconds", f3(m.WriteStallSeconds)},
+		{"write_slowdowns", u(m.WriteSlowdowns)},
+		{"table_files", strconv.Itoa(m.TableFiles)},
+		{"l0_files", strconv.Itoa(m.Levels[0].Files)},
+		{"compactions", u(m.Compactions)},
+		{"compaction_errors", u(m.CompactionErrors)},
+		{"compaction_bytes_read", u(m.CompactionBytesIn)},
+		{"compaction_bytes_written", u(m.CompactionBytesOut)},
+		{"compaction_entries_dropped", u(m.CompactionDropped)},
+		{"compaction_seconds", f3(m.CompactionSeconds)},
+		{"compaction_throttled_seconds", f3(m.ThrottledSeconds)},
+		{"user_bytes_written", u(m.UserBytes)},
+		{"write_amplification", fmt.Sprintf("%.2f", m.WriteAmplification)},
+		{"bloom_checked", u(m.BloomChecked)},
+		{"bloom_skipped", u(m.BloomSkipped)},
+		{"bloom_false_positive", u(m.BloomFalsePositive)},
+		{"bloom_useful_rate", fmt.Sprintf("%.4f", m.BloomUsefulRate)},
+		{"block_reads", u(m.BlockReads)},
+		{"block_cache_hits", u(m.CacheHits)},
+		{"block_cache_misses", u(m.CacheMisses)},
+		{"wal_segment", u(m.WALSegment)},
+		{"wal_active_bytes", i(m.WALActiveBytes)},
+		{"wal_bytes_written", u(m.WALBytesWritten)},
+		{"wal_batches", u(m.WALBatches)},
+		{"wal_groups", u(m.WALGroups)},
+		{"wal_fsyncs", u(m.WALFsyncs)},
+		{"wal_max_group", u(m.WALMaxGroup)},
+		{"recovery_batches", strconv.Itoa(m.RecoveryBatches)},
+		{"recovery_torn_tail", strconv.FormatBool(m.RecoveryTornTail)},
+		{"recovery_truncated_bytes", i(m.RecoveryTruncatedBytes)},
+		{"manifest_number", u(m.ManifestNumber)},
 	}
-	for i := range files {
-		if files[i] > 0 {
-			st = append(st, Stat{fmt.Sprintf("level%d", i), fmt.Sprintf("files=%d,bytes=%d", files[i], bytes[i])})
+	for lvl, l := range m.Levels {
+		if l.Files > 0 {
+			st = append(st, Stat{fmt.Sprintf("level%d", lvl), fmt.Sprintf("files=%d,bytes=%d", l.Files, l.Bytes)})
 		}
 	}
-	if d.cache != nil {
-		cs := d.cache.Stats()
+	if m.CacheEnabled {
 		st = append(st,
-			Stat{"block_cache_bytes", strconv.FormatInt(cs.Bytes, 10)},
-			Stat{"block_cache_entries", strconv.FormatInt(cs.Entries, 10)},
-			Stat{"block_cache_evictions", u(cs.Evictions)},
-			Stat{"block_cache_hit_rate", fmt.Sprintf("%.4f", cs.HitRate())})
+			Stat{"block_cache_bytes", i(m.CacheBytes)},
+			Stat{"block_cache_entries", i(m.CacheEntries)},
+			Stat{"block_cache_evictions", u(m.CacheEvictions)},
+			Stat{"block_cache_hit_rate", fmt.Sprintf("%.4f", m.CacheHitRate)})
 	}
-	if err := d.wal.Err(); err != nil {
-		st = append(st, Stat{"wal_failed", fmt.Sprint(err)})
+	if m.WALFailed != "" {
+		st = append(st, Stat{"wal_failed", m.WALFailed})
 	}
 	return st
 }
@@ -1130,6 +1146,7 @@ func (d *DB) Close() error {
 	d.mu.Lock()
 	d.closeTables()
 	d.mu.Unlock()
+	d.unlock()
 	return err
 }
 

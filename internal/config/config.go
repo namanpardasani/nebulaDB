@@ -64,6 +64,7 @@ type Config struct {
 	LogLevel  string // debug | info | warn | error
 	LogFormat string // text | json
 	DevMode   bool   // enables dev-only admin endpoints (crash button)
+	Supervise bool   // run under a supervisor that restarts the server after a crash (implies -dev)
 }
 
 // Default returns the default configuration.
@@ -130,6 +131,7 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "debug | info | warn | error")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "text | json")
 	fs.BoolVar(&c.DevMode, "dev", c.DevMode, "enable dev-only admin endpoints")
+	fs.BoolVar(&c.Supervise, "supervise", c.Supervise, "run under a supervisor that restarts the server if it is killed (implies -dev; for the Inspector crash demo)")
 }
 
 // Parse parses args (without the program name) into a validated Config.
