@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: Staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          install-go: false
+      - name: Test (race)
+        run: go test -race ./...
+      - name: Short fuzz
+        run: make fuzz FUZZTIME=10s
