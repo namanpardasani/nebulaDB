@@ -58,6 +58,11 @@ func run() error {
 			Sync: policy, SyncEvery: cfg.FsyncInterval, GroupCommit: cfg.GroupCommit,
 			MemtableSize: cfg.MemtableSize, MaxImmutables: cfg.MaxImmutables,
 			BlockSize: cfg.BlockSize, BloomBits: cfg.BloomBitsKey, BlockCacheBytes: cacheBytes, Logger: log,
+			Compaction: engine.CompactionOptions{
+				Style: cfg.Compaction, L0CompactTrigger: cfg.L0CompactTrigger, L0SlowdownTrigger: cfg.L0SlowdownTrigger,
+				L0StopTrigger: cfg.L0StopTrigger, LevelSizeRatio: cfg.LevelSizeRatio, L1MaxBytes: cfg.L1MaxBytes,
+				TargetFileBytes: cfg.TargetFileSize, RateBytesPerSec: cfg.CompactionRate,
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("recovery failed: %w", err)

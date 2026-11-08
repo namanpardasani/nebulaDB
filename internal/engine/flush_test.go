@@ -411,6 +411,7 @@ func TestScanAcrossTablesAndMemtable(t *testing.T) {
 	dir := t.TempDir()
 	clk := enginetest.NewClock()
 	o := dbOpts(vfs.Default, dir, clk, 1<<20, wal.SyncNever) // big: flush only when we ask
+	o.Compaction.Disabled = true                             // keep the 5 overlapping L0 tables as they are
 	d := openDB(t, o)
 	defer d.Close()
 	rng := rand.New(rand.NewSource(11))

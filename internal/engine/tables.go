@@ -54,7 +54,13 @@ func (t *tableFile) unref() {
 // and do not overlap.
 type version struct {
 	levels [manifest.NumLevels][]*tableFile
-	refs   atomic.Int32
+	// l0BySeq is levels[0] ordered by MaxSeq descending, the order point lookups
+	// search in. It makes lookups correct for ANY L0 layout: with the usual
+	// disjoint flush outputs the newest file wins and the scan stops at once;
+	// with size-tiered compaction, whose outputs interleave sequence ranges,
+	// every file that could hold a newer version is still consulted.
+	l0BySeq []*tableFile
+	refs    atomic.Int32
 }
 
 func (v *version) ref() { v.refs.Add(1) }
@@ -67,6 +73,20 @@ func (v *version) unref() {
 			}
 		}
 	}
+}
+
+// buildIndexes derives lookup structures from levels. It MUST run on every
+// version before use (Open and next both call it): a version without l0BySeq
+// silently cannot see its L0 files.
+func (v *version) buildIndexes() {
+	v.l0BySeq = append([]*tableFile(nil), v.levels[0]...)
+	sort.Slice(v.l0BySeq, func(i, j int) bool {
+		a, b := v.l0BySeq[i].meta, v.l0BySeq[j].meta
+		if a.MaxSeq != b.MaxSeq {
+			return a.MaxSeq > b.MaxSeq
+		}
+		return a.Num > b.Num
+	})
 }
 
 // next builds the version that results from removing `del` (by file number,
@@ -97,24 +117,38 @@ func (v *version) next(add []*tableFile, del map[uint64]bool) *version {
 			f.ref()
 		}
 	}
+	nv.buildIndexes()
 	nv.refs.Store(1) // the caller's (DB's) reference
 	return nv
 }
 
 // get finds the newest version of key with seq <= snap among the tables.
-// Search order encodes recency: L0 newest file first (L0 files cover disjoint,
-// increasing sequence ranges), then L1, L2, ... where each level has at most
-// one candidate file. The first table that contains any visible version wins.
+//
+// L0 files may overlap, so all that could hold the key are consulted in
+// MaxSeq-descending order, keeping the highest-seq hit; the loop stops as soon
+// as the next file cannot beat the best hit. Deeper levels hold strictly older
+// data than L0 (and each level older than the one above it), and each has at
+// most one candidate file, so the first level that yields a hit wins.
 func (v *version) get(key []byte, snap uint64) (iterator.Entry, bool, error) {
-	l0 := v.levels[0]
-	for i := len(l0) - 1; i >= 0; i-- {
-		f := l0[i]
+	var best iterator.Entry
+	found := false
+	for _, f := range v.l0BySeq {
+		if found && f.meta.MaxSeq <= best.Seq {
+			break
+		}
 		if !f.r.MayContainRange(key) {
 			continue
 		}
-		if e, ok, err := f.r.Get(key, snap); err != nil || ok {
-			return e, ok, err
+		e, ok, err := f.r.Get(key, snap)
+		if err != nil {
+			return iterator.Entry{}, false, err
 		}
+		if ok && (!found || e.Seq > best.Seq) {
+			best, found = e, true
+		}
+	}
+	if found {
+		return best, true, nil
 	}
 	for lvl := 1; lvl < manifest.NumLevels; lvl++ {
 		fs := v.levels[lvl]

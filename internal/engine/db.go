@@ -47,6 +47,9 @@ type Options struct {
 	// negative = disabled.
 	BlockCacheBytes int64
 
+	// Compaction tunes background compaction and L0 backpressure.
+	Compaction CompactionOptions
+
 	BlockSize   int // SSTable data block size (default 4096)
 	BloomBits   int // Bloom filter bits per key (0 disables; default set by caller)
 	ManifestMax int64
@@ -75,6 +78,7 @@ func (o *Options) fill() {
 	if o.BlockCacheBytes == 0 {
 		o.BlockCacheBytes = 32 << 20
 	}
+	o.Compaction.fill()
 	if o.Now == nil {
 		o.Now = func() int64 { return time.Now().UnixMilli() }
 	}
@@ -134,13 +138,19 @@ type DB struct {
 	visible atomic.Uint64 // highest fully applied sequence number
 	kl      keyLocks
 
-	cache    *cache.Cache // nil when disabled
-	flushCh  chan struct{}
-	stopCh   chan struct{}
-	flushWG  sync.WaitGroup
-	tstats   sstable.Stats
-	recovery wal.RecoveryInfo
-	mrecover manifest.Info
+	cache     *cache.Cache // nil when disabled
+	flushCh   chan struct{}
+	stopCh    chan struct{}
+	flushWG   sync.WaitGroup
+	compactCh chan struct{}
+	compactWG sync.WaitGroup
+	// compactMu serialises compactions (background worker vs CompactAll) and
+	// guards compactPtr, the per-level round-robin pick position.
+	compactMu  sync.Mutex
+	compactPtr [manifest.NumLevels][]byte
+	tstats     sstable.Stats
+	recovery   wal.RecoveryInfo
+	mrecover   manifest.Info
 
 	rotations    atomic.Uint64
 	rotateErrs   atomic.Uint64
@@ -151,6 +161,17 @@ type DB struct {
 	stallNanos   atomic.Uint64
 	stalls       atomic.Uint64
 	deletedFiles atomic.Uint64
+
+	compactions    atomic.Uint64
+	compactErrs    atomic.Uint64
+	compactNanos   atomic.Uint64
+	compactRead    atomic.Uint64
+	compactWritten atomic.Uint64
+	compactDropped atomic.Uint64
+	throttled      atomic.Uint64 // nanoseconds slept by the rate limiter
+	slowdowns      atomic.Uint64
+	slowdownNanos  atomic.Uint64
+	userBytes      atomic.Uint64 // key+value bytes accepted from clients
 }
 
 func sstPath(dir string, num uint64) string {
@@ -172,6 +193,7 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 		opts: opts, mem: memtable.New(),
 		tables:  map[uint64]*tableFile{},
 		flushCh: make(chan struct{}, 1), stopCh: make(chan struct{}),
+		compactCh: make(chan struct{}, 1),
 	}
 	d.cond = sync.NewCond(&d.mu)
 	if opts.BlockCacheBytes > 0 {
@@ -200,6 +222,7 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 			live[fm.Num] = true
 		}
 	}
+	d.cur.buildIndexes()
 	d.cur.refs.Store(1)
 	if err := d.removeOrphans(live); err != nil {
 		d.closeTables()
@@ -232,7 +255,10 @@ func Open(opts Options) (*DB, wal.RecoveryInfo, error) {
 
 	d.flushWG.Add(1)
 	go d.flushLoop()
-	d.maybeRotate() // replay may have produced an over-threshold memtable
+	d.compactWG.Add(1)
+	go d.compactionLoop()
+	d.kickCompaction() // the recovered tree may already need compaction
+	d.maybeRotate()    // replay may have produced an over-threshold memtable
 	return d, info, nil
 }
 
@@ -306,6 +332,11 @@ func (d *DB) insert(first uint64, ops []wal.Op) {
 
 // commit makes ops durable and visible.
 func (d *DB) commit(ops []wal.Op) error {
+	var n uint64
+	for i := range ops {
+		n += uint64(len(ops[i].Key) + len(ops[i].Value))
+	}
+	d.userBytes.Add(n)
 	return d.wal.Commit(&wal.Batch{Ops: ops}, func(first uint64) {
 		d.insert(first, ops)
 		d.visible.Store(first + uint64(len(ops)) - 1)
@@ -362,34 +393,71 @@ func (d *DB) kickFlush() {
 	}
 }
 
-// waitForRoom is the write stall: while the flush backlog is at its limit,
-// writers wait. It is called before a writer takes any key lock, so the flush
-// goroutine (which needs none) can always make progress and wake us.
+// l0Limits returns the L0 file counts at which writers are slowed / stopped.
+// Tiered trees legitimately keep several files per size tier, so their limits
+// are scaled up.
+func (d *DB) l0Limits() (slow, stop int) {
+	co := d.opts.Compaction
+	slow, stop = co.L0SlowdownTrigger, co.L0StopTrigger
+	if d.opts.tiered() {
+		slow, stop = slow*4, stop*4
+	}
+	return
+}
+
+// waitForRoom is the write backpressure, applied before a writer takes any key
+// lock (so the flush and compaction goroutines, which need none, can always make
+// progress and wake us). Three regimes:
+//
+//  1. Flush backlog >= MaxImmutables, or L0 files >= stop trigger: writers BLOCK
+//     until background work catches up, failing with ErrWriteStall after
+//     StallTimeout so a dead disk cannot hang clients forever.
+//  2. L0 files >= slowdown trigger: each write is delayed by 1 ms, which gives
+//     compaction time to drain L0 without a hard stop (smooths latency).
+//  3. Otherwise: no delay.
 func (d *DB) waitForRoom() error {
+	slowStart, stopAt := d.l0Limits()
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.closed {
-		return ErrClosed
-	}
-	if len(d.imms) < d.opts.MaxImmutables {
-		return nil
-	}
-	t0 := time.Now()
-	d.stalls.Add(1)
-	d.emit(Event{Type: EventWriteStall, Count: int64(len(d.imms)), Detail: "immutable memtable backlog"})
-	// sync.Cond has no timeout; a timer broadcasts so we can give up.
-	timer := time.AfterFunc(d.opts.StallTimeout, func() { d.mu.Lock(); d.cond.Broadcast(); d.mu.Unlock() })
-	defer timer.Stop()
-	for len(d.imms) >= d.opts.MaxImmutables && !d.closed {
+	var t0 time.Time
+	var timer *time.Timer
+	stalled := false
+	for {
+		if d.closed {
+			d.mu.Unlock()
+			return ErrClosed
+		}
+		l0 := len(d.cur.levels[0])
+		if len(d.imms) < d.opts.MaxImmutables && l0 < stopAt {
+			break
+		}
+		if !stalled {
+			stalled = true
+			t0 = time.Now()
+			d.stalls.Add(1)
+			d.emit(Event{Type: EventWriteStall, Count: int64(len(d.imms)), Level: l0, Detail: "flush backlog or L0 file count"})
+			// sync.Cond has no timeout; a timer broadcasts so we can give up.
+			timer = time.AfterFunc(d.opts.StallTimeout, func() { d.mu.Lock(); d.cond.Broadcast(); d.mu.Unlock() })
+			d.kickCompaction()
+		}
 		if time.Since(t0) >= d.opts.StallTimeout {
 			d.stallNanos.Add(uint64(time.Since(t0)))
+			timer.Stop()
+			d.mu.Unlock()
 			return ErrWriteStall
 		}
 		d.cond.Wait()
 	}
-	d.stallNanos.Add(uint64(time.Since(t0)))
-	if d.closed {
-		return ErrClosed
+	if stalled {
+		d.stallNanos.Add(uint64(time.Since(t0)))
+		timer.Stop()
+	}
+	slow := len(d.cur.levels[0]) >= slowStart
+	d.mu.Unlock()
+	if slow {
+		t := time.Now()
+		time.Sleep(time.Millisecond)
+		d.slowdowns.Add(1)
+		d.slowdownNanos.Add(uint64(time.Since(t)))
 	}
 	return nil
 }
@@ -472,6 +540,7 @@ func (d *DB) flushOne() (ok bool, err error) {
 	d.mu.Unlock()
 	if tf != nil {
 		old.unref()
+		d.kickCompaction()
 	}
 
 	// Only now are the WAL segments redundant.
@@ -943,6 +1012,17 @@ func (d *DB) FlushMemtable() error {
 	return d.WaitForFlush()
 }
 
+// writeAmp is total bytes written to disk (WAL + flush + compaction) divided by
+// the key+value bytes clients submitted.
+func (d *DB) writeAmp() float64 {
+	user := d.userBytes.Load()
+	if user == 0 {
+		return 0
+	}
+	disk := d.wal.Stats().Bytes + d.flushBytes.Load() + d.compactWritten.Load()
+	return float64(disk) / float64(user)
+}
+
 // Levels reports (file count, bytes) per level for INFO/metrics.
 func (d *DB) Levels() (files [manifest.NumLevels]int, bytes [manifest.NumLevels]int64) {
 	d.mu.RLock()
@@ -979,6 +1059,17 @@ func (d *DB) Stats() []Stat {
 		{"write_stalls", u(d.stalls.Load())},
 		{"write_stall_seconds", fmt.Sprintf("%.3f", float64(d.stallNanos.Load())/1e9)},
 		{"table_files", strconv.Itoa(cur.numFiles())},
+		{"l0_files", strconv.Itoa(len(cur.levels[0]))},
+		{"compactions", u(d.compactions.Load())},
+		{"compaction_errors", u(d.compactErrs.Load())},
+		{"compaction_bytes_read", u(d.compactRead.Load())},
+		{"compaction_bytes_written", u(d.compactWritten.Load())},
+		{"compaction_entries_dropped", u(d.compactDropped.Load())},
+		{"compaction_seconds", fmt.Sprintf("%.3f", float64(d.compactNanos.Load())/1e9)},
+		{"compaction_throttled_seconds", fmt.Sprintf("%.3f", float64(d.throttled.Load())/1e9)},
+		{"write_slowdowns", u(d.slowdowns.Load())},
+		{"user_bytes_written", u(d.userBytes.Load())},
+		{"write_amplification", fmt.Sprintf("%.2f", d.writeAmp())},
 		{"bloom_checked", u(d.tstats.BloomChecked.Load())},
 		{"bloom_skipped", u(d.tstats.BloomSkipped.Load())},
 		{"bloom_false_positive", u(d.tstats.BloomFalsePositive.Load())},
@@ -1030,6 +1121,7 @@ func (d *DB) Close() error {
 	d.mu.Unlock()
 	close(d.stopCh)
 	d.flushWG.Wait()
+	d.compactWG.Wait()
 
 	err := d.wal.Close()
 	if merr := d.mf.Close(); err == nil {

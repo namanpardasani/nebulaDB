@@ -58,6 +58,8 @@ type Config struct {
 	L0StopTrigger     int    // L0 file count where writes stop
 	LevelSizeRatio    int    // size multiplier between levels
 	L1MaxBytes        int64  // target size of level 1
+	TargetFileSize    int64  // leveled compaction output file size
+	CompactionRate    int64  // compaction write throttle in bytes/s (0 = off)
 
 	LogLevel  string // debug | info | warn | error
 	LogFormat string // text | json
@@ -88,6 +90,7 @@ func Default() Config {
 		L0StopTrigger:     12,
 		LevelSizeRatio:    10,
 		L1MaxBytes:        16 << 20,
+		TargetFileSize:    2 << 20,
 
 		LogLevel:  "info",
 		LogFormat: "text",
@@ -121,6 +124,8 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.L0StopTrigger, "l0-stop", c.L0StopTrigger, "L0 file count that stops writes")
 	fs.IntVar(&c.LevelSizeRatio, "level-ratio", c.LevelSizeRatio, "size ratio between levels")
 	fs.Int64Var(&c.L1MaxBytes, "l1-bytes", c.L1MaxBytes, "target size of level 1 in bytes")
+	fs.Int64Var(&c.TargetFileSize, "target-file-size", c.TargetFileSize, "leveled compaction output file size in bytes")
+	fs.Int64Var(&c.CompactionRate, "compaction-rate", c.CompactionRate, "compaction write throttle in bytes/second (0 = unlimited)")
 
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "debug | info | warn | error")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "text | json")
@@ -186,6 +191,12 @@ func (c *Config) Validate() error {
 	}
 	if c.LevelSizeRatio < 2 {
 		return fmt.Errorf("config: -level-ratio must be >= 2")
+	}
+	if c.TargetFileSize < 1<<10 {
+		return fmt.Errorf("config: -target-file-size must be >= 1KiB")
+	}
+	if c.CompactionRate < 0 {
+		return fmt.Errorf("config: -compaction-rate must be >= 0")
 	}
 	if c.L1MaxBytes < 1<<10 {
 		return fmt.Errorf("config: -l1-bytes must be >= 1KiB")
