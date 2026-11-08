@@ -617,7 +617,12 @@ func fetchAll(c *client, keys []string) (map[string]observed, error) {
 
 // matchCandidate decides whether an observation is consistent with candidate
 // state cs at time now, given the window in which a TTL could have fired.
-func matchCandidate(o observed, cs keyState, now time.Time, ackBound time.Time) bool {
+//
+// The read of the keys happens somewhere in [readStart, readEnd]; a key is
+// REQUIRED present only if even the end of that window precedes the earliest
+// possible expiry, and REQUIRED absent only if even its start is past the latest
+// possible expiry. In between either answer is legal (the TTL fired mid-read).
+func matchCandidate(o observed, cs keyState, readStart, readEnd time.Time, ackBound time.Time) bool {
 	if !cs.Present {
 		return !o.present
 	}
@@ -632,9 +637,9 @@ func matchCandidate(o observed, cs keyState, now time.Time, ackBound time.Time) 
 		lo := cs.SentAt.Add(time.Duration(cs.TTLms)*time.Millisecond - 25*time.Millisecond)
 		hi := ackBound.Add(time.Duration(cs.TTLms)*time.Millisecond + 25*time.Millisecond)
 		switch {
-		case now.Before(lo):
+		case readEnd.Before(lo):
 			return valid()
-		case now.After(hi):
+		case readStart.After(hi):
 			return !o.present
 		default:
 			return valid() || !o.present
@@ -654,7 +659,9 @@ func verifyAll(c *client, models []*writerModel, now time.Time) (viol []string, 
 			owner[k] = m
 		}
 	}
+	readStart := time.Now()
 	obs, err := fetchAll(c, all)
+	readEnd := time.Now()
 	if err != nil {
 		return []string{"verification read failed: " + err.Error()}, 0, 0, 0
 	}
@@ -702,7 +709,7 @@ func verifyAll(c *client, models []*writerModel, now time.Time) (viol []string, 
 		pendGrp := p != nil && p.Kind == opMSet
 		matchAll := func(cs keyState) bool {
 			for _, k := range gk {
-				if !matchCandidate(obs[k], cs, now, now) {
+				if !matchCandidate(obs[k], cs, readStart, readEnd, now) {
 					return false
 				}
 			}
@@ -746,7 +753,7 @@ func verifyAll(c *client, models []*writerModel, now time.Time) (viol []string, 
 				pendCand = &cs
 			}
 			switch {
-			case matchCandidate(o, cands[0], now, orNow(cands[0].AckAt, now)):
+			case matchCandidate(o, cands[0], readStart, readEnd, orNow(cands[0].AckAt, now)):
 				if pendCand != nil {
 					discarded++
 				}
@@ -754,7 +761,7 @@ func verifyAll(c *client, models []*writerModel, now time.Time) (viol []string, 
 				if !o.present {
 					m.Acked[k] = keyState{}
 				}
-			case pendCand != nil && matchCandidate(o, *pendCand, now, now):
+			case pendCand != nil && matchCandidate(o, *pendCand, readStart, readEnd, now):
 				applied++
 				if o.present {
 					m.Acked[k] = *pendCand
