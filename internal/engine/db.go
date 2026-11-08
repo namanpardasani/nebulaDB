@@ -514,6 +514,10 @@ func (d *DB) flushOne() (ok bool, err error) {
 		d.mu.RUnlock()
 		return false, nil
 	}
+	if err := d.mf.Err(); err != nil {
+		d.mu.RUnlock()
+		return false, err // read-only manifest: do not write tables that can never be installed
+	}
 	im := d.imms[len(d.imms)-1]
 	d.mu.RUnlock()
 
@@ -535,7 +539,13 @@ func (d *DB) flushOne() (ok bool, err error) {
 	if err := d.mf.LogAndApply(edit); err != nil {
 		if tf != nil {
 			tf.r.Close()
-			d.opts.FS.Remove(tf.path)
+			// Only delete the table if the edit certainly did not happen. If its
+			// fate is unknown it may be durable, and then the MANIFEST names this
+			// file: deleting it would make the next startup refuse to open.
+			// Left in place, startup either adopts it or removes it as an orphan.
+			if !manifest.IsUncertain(err) {
+				d.opts.FS.Remove(tf.path)
+			}
 		}
 		return false, err
 	}

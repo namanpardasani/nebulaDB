@@ -24,4 +24,4 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
       - name: Short fuzz
-        run: make fuzz FUZZTIME=10s
+        run: ./scripts/fuzz.sh 10s

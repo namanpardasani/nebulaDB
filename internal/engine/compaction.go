@@ -316,6 +316,9 @@ var errStopped = errors.New("compaction stopped: database closing")
 // deleted at startup, inputs untouched. Crash after: inputs are orphans.
 // Either way exactly one consistent set of files is live.
 func (d *DB) runCompaction(c *compaction) (err error) {
+	if err := d.mf.Err(); err != nil {
+		return err // read-only manifest: merging would only create unusable files
+	}
 	for _, f := range c.inputs {
 		f.ref() // keep inputs readable/openable for the whole merge
 	}
@@ -492,6 +495,14 @@ func (d *DB) runCompaction(c *compaction) (err error) {
 		del[f.meta.Num] = true
 	}
 	if err := d.mf.LogAndApply(edit); err != nil {
+		if manifest.IsUncertain(err) {
+			// The edit may be durable: keep the outputs (see flushOne). Inputs are
+			// untouched, so either outcome after a restart is consistent.
+			for _, o := range outputs {
+				o.r.Close()
+			}
+			return err
+		}
 		cleanup()
 		return err
 	}

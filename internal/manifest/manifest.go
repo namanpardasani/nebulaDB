@@ -27,6 +27,23 @@ const (
 // starting fresh would silently orphan data.
 var ErrMissingCurrent = errors.New("manifest: CURRENT file is missing but SSTable files exist (refusing to start; restore CURRENT or run `nebula repair`)")
 
+// UncertainError wraps a failure after which the edit MAY nevertheless be
+// durable: the record was handed to the OS but could not be confirmed (fsync
+// failed), or a partial append could not be rolled back. The caller must then
+// NOT delete files the edit refers to: after a restart the MANIFEST either
+// lists them (they are live) or does not (they are orphans that startup deletes).
+// Deleting them here could leave a MANIFEST that names missing files.
+type UncertainError struct{ Err error }
+
+func (e *UncertainError) Error() string { return e.Err.Error() }
+func (e *UncertainError) Unwrap() error { return e.Err }
+
+// IsUncertain reports whether err means the edit's fate is unknown.
+func IsUncertain(err error) bool {
+	var u *UncertainError
+	return errors.As(err, &u)
+}
+
 // CorruptionError reports damage in the middle of a manifest.
 type CorruptionError struct {
 	File   string
@@ -315,7 +332,9 @@ func (m *Manifest) LogAndApply(e *Edit) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failed != nil {
-		return m.failed
+		// Nothing is written on this call, so the edit is definitely not applied
+		// (hence not wrapped as uncertain).
+		return fmt.Errorf("manifest is read-only after an earlier failure: %w", errors.Unwrap(m.failed))
 	}
 	next := m.cur.Clone()
 	e.HasNextFileNum, e.NextFileNum = true, m.cur.NextFileNum
@@ -335,11 +354,11 @@ func (m *Manifest) LogAndApply(e *Edit) error {
 				return fmt.Errorf("manifest: append failed (rolled back): %w", err)
 			}
 		}
-		m.failed = fmt.Errorf("manifest: append failed and tail could not be repaired, manifest is now read-only: %w", err)
+		m.failed = &UncertainError{fmt.Errorf("manifest: append failed and tail could not be repaired, manifest is now read-only: %w", err)}
 		return m.failed
 	}
 	if err := m.f.Sync(); err != nil {
-		m.failed = fmt.Errorf("manifest: fsync failed, manifest is now read-only: %w", err)
+		m.failed = &UncertainError{fmt.Errorf("manifest: fsync failed, manifest is now read-only: %w", err)}
 		return m.failed
 	}
 	m.size += int64(len(rec))
@@ -372,6 +391,13 @@ func (m *Manifest) rewriteLocked() error {
 	m.fs.Remove(manifestFile(m.dir, oldNum)) // best effort; Open cleans stragglers
 	m.fs.SyncDir(m.dir)
 	return nil
+}
+
+// Err returns the sticky failure that made the manifest read-only, or nil.
+func (m *Manifest) Err() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failed
 }
 
 // Rewrite forces a snapshot rewrite (used by tests and `nebula compact`).

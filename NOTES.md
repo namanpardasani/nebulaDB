@@ -128,6 +128,18 @@ Phase 10 will re-run these properly (multiple counts, benchstat).
 - **Fix:** one `buildIndexes()` called from both `Open` and `next()`, with a comment that every version must run it.
 - **Why tests caught it:** restart-then-verify-everything tests (`checkAll` after reopen) with compaction/flush active. Lesson: derived lookup structures should have exactly one constructor.
 
+### 5. Failed MANIFEST fsync deleted a table the MANIFEST might name; next startup refused to open (Phase 9, found by tests/fault TestFsyncFailureByFileClass/MANIFEST)
+- **Symptom:** inject an fsync failure on the MANIFEST during a flush, then restart: `open: live table 000002.sst (level 0): no such file or directory` — the database would not start.
+- **Cause:** flush (and compaction) treated ANY `LogAndApply` error as "the edit did not happen" and deleted the freshly written SSTable. But when the manifest record was written and only its fsync failed, the edit's fate is unknown: the bytes sit in the page cache and a process restart (no power loss) reads them back, so the MANIFEST then references a file we had already deleted.
+- **Fix:** `manifest.UncertainError` / `IsUncertain`: returned when an append's fate is unknown (fsync failure, or a partial append that could not be truncated away). On an uncertain failure flush and compaction KEEP their output files: after a restart the MANIFEST either lists them (live) or not (orphans, deleted at startup); compaction inputs are never touched before the edit, so either outcome is consistent. Definite failures (write rolled back, invalid edit) still clean up. Also: later calls on a poisoned manifest fail fast with a definite error, and the flush/compaction loops check `Manifest.Err()` first so they stop creating files that can never be installed.
+- **Rule of thumb for interviews:** after an I/O error, ask "what are the possible on-disk outcomes?" and make every one of them recoverable; cleaning up is only safe when exactly one outcome is possible.
+
+### Test-harness bugs fixed along the way (not engine bugs, kept for honesty)
+- Crash harness: two `freePort()` calls returned the same ephemeral port (server could not bind its admin port) -> reserve all ports at once. SCAN-vs-GET cross-check raced with short-TTL expiry -> SCAN-present/GET-absent is legal only for TTL keys.
+- Fault chaos test: a clean (non-power-loss) restart showing a state does not prove it is durable (e.g. an fsync-failed record read back from the page cache); a later power loss may still revert it. The model now adopts observations only after power loss.
+- Protocol model: the fake clock must not advance inside a pipelined batch.
+- Mutation check: re-introducing bug #2 (rotation in the middle of a group commit) into a throwaway binary made the crash harness report 2 lost acknowledged writes in iteration 2 of 200, proving the harness can detect that class of bug.
+
 ## Interview Q&A
 
 ## Progress log
