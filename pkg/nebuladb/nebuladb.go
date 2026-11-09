@@ -53,6 +53,19 @@ type Options struct {
 	// MemtableSize is the in-memory buffer size before it is sealed; default 4 MiB.
 	MemtableSize int64
 	Logger       *slog.Logger
+
+	// CompactionStyle is "leveled" (default) or "size-tiered".
+	CompactionStyle string
+	// BlockCacheBytes sizes the block cache: 0 = default (32 MiB), <0 = disabled.
+	BlockCacheBytes int64
+	// BloomBitsPerKey: 0 = default (10), <0 = no Bloom filters.
+	BloomBitsPerKey int
+	// Compaction tuning (0 = engine default): L0 file-count trigger, L1 target
+	// size, size ratio between levels, output file size.
+	L0CompactTrigger int
+	L1MaxBytes       int64
+	LevelSizeRatio   int
+	TargetFileBytes  int64
 }
 
 // DB is an open database.
@@ -71,9 +84,21 @@ func Open(dir string, opts *Options) (*DB, error) {
 	case SyncNever:
 		p = wal.SyncNever
 	}
+	bloom := opts.BloomBitsPerKey
+	switch {
+	case bloom == 0:
+		bloom = 10
+	case bloom < 0:
+		bloom = 0
+	}
 	e, _, err := engine.Open(engine.Options{
 		Dir: dir, Sync: p, SyncEvery: opts.SyncInterval,
-		GroupCommit: !opts.DisableGroupCommit, MemtableSize: opts.MemtableSize, BloomBits: 10, Logger: opts.Logger,
+		GroupCommit: !opts.DisableGroupCommit, MemtableSize: opts.MemtableSize, BloomBits: bloom, Logger: opts.Logger,
+		BlockCacheBytes: opts.BlockCacheBytes,
+		Compaction: engine.CompactionOptions{
+			Style: opts.CompactionStyle, L0CompactTrigger: opts.L0CompactTrigger, L1MaxBytes: opts.L1MaxBytes,
+			LevelSizeRatio: opts.LevelSizeRatio, TargetFileBytes: opts.TargetFileBytes,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -160,3 +185,13 @@ func (d *DB) Stats() map[string]string {
 	}
 	return m
 }
+
+// FlushAndWait seals the in-memory buffer and waits until it is on disk
+// (useful before measuring on-disk size).
+func (d *DB) FlushAndWait() error { return d.e.FlushMemtable() }
+
+// CompactAll flushes and merges all data down to the deepest level.
+func (d *DB) CompactAll() error { return d.e.CompactAll() }
+
+// WaitIdle blocks until background flushes are done.
+func (d *DB) WaitIdle() error { return d.e.WaitForFlush() }

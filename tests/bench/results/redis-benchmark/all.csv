@@ -1,0 +1,6 @@
+nebuladb-always,P1,"test","rps","avg_latency_ms","min_latency_ms","p50_latency_ms","p95_latency_ms","p99_latency_ms","max_latency_ms"
+nebuladb-always,P1,"SET","4222.62","7.470","2.752","6.103","14.551","18.271","46.687"
+nebuladb-always,P1,"GET","70921.98","0.302","0.016","0.263","0.535","0.775","23.407"
+nebuladb-always,P16,"test","rps","avg_latency_ms","min_latency_ms","p50_latency_ms","p95_latency_ms","p99_latency_ms","max_latency_ms"
+nebuladb-always,P16,"SET","5599.73","91.218","59.712","89.087","117.247","137.343","183.551"
+nebuladb-always,P16,"GET","735294.06","0.543","0.096","0.375","1.487","2.415","4.863"
