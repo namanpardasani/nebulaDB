@@ -229,3 +229,21 @@ stay deleted), without one it takes every table and deleted keys may reappear.
   (the lock file prevents it on local Linux/macOS filesystems; there is none on Windows).
 * A lost *reply*: if the connection dies after the server applied a write, the
   client cannot tell. Use idempotent commands or read back.
+
+## 10. Replication failure modes (Phase 13)
+
+Tests: `internal/repl/repl_test.go` (in-process) and `tests/repl/kill_test.go` (real processes, `SIGKILL`).
+
+| failure | what happens | guarantee / test |
+|---|---|---|
+| Leader `SIGKILL`, sync mode (`-repl-min-acks 1`) | Every write the client saw acknowledged was applied durably on the replica before the reply | 0 of 69,513 acknowledged writes missing on the replica or after promoting it (`TestSyncReplicationLeaderKillLosesNothingAcknowledged`) |
+| Leader `SIGKILL`, async mode | Writes acknowledged but not yet shipped can be lost | Allowed by the contract; the run observed 0 of 48,614 on localhost, which proves nothing about slower links (`TestAsyncReplicationLeaderKillReport` only reports) |
+| Follower `SIGKILL` | Resumes from its saved position (lazily written, may re-receive a few batches: idempotent) | `TestFollowerRestartContinuesWithoutResync`, `TestFollowerKillCatchesUpAndConverges` |
+| Follower dies during a full resync | `syncing` was persisted first, so the next start announces position 0 and takes a fresh snapshot | by construction; partial copies are never trusted |
+| Follower too far behind the leader's in-memory log | Leader closes the stream, follower reconnects and takes a snapshot, wiping local data first so keys deleted meanwhile are gone | `TestBacklogOverflowForcesResyncAndRemovesStaleKeys` |
+| Leader restarts | Same identity (`REPLID`); a follower exactly at its last sequence continues, an older one takes a snapshot | `TestLeaderRestartKeepsIdentityAndFollowerCatchesUp` |
+| Different leader (new data directory) at the same address | Identity mismatch: follower wipes and resyncs, so a deposed leader's unreplicated writes are discarded | `TestNewLeaderDirectoryForcesResyncAndWipesOldData` |
+| Corrupted frame on the wire | CRC32C mismatch closes the connection; every single-bit flip of a frame is detected | `TestProtocolRejectsCorruptionAndGarbage`, `FuzzDecodeBatch` |
+| Sync ack does not arrive in time | Write applied on the leader but the client gets an error: outcome unknown | `TestSyncAcksMeanDurableOnReplicaBeforeReply` |
+| Follower power loss with `-fsync every|never` | Its position file (fsynced) can be ahead of its WAL: use `-fsync always` on followers you may promote | documented limitation |
+| Network partition / two writable leaders | **Not handled** (no consensus, no fencing) | documented limitation |
