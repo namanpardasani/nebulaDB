@@ -767,10 +767,26 @@ func (d *DB) TTL(key []byte) (int64, error) {
 // reflects every earlier write to these keys (each such write finished its
 // apply before releasing its stripe).
 func (d *DB) beginWrite(keys ...[]byte) (view, func(), error) {
+	return d.beginWriteMode(true, keys...)
+}
+
+// beginWriteMode is beginWrite with the option to skip pinning a read view, for
+// writes that do not depend on the current value (see Set).
+func (d *DB) beginWriteMode(needView bool, keys ...[]byte) (view, func(), error) {
 	if err := d.waitForRoom(); err != nil {
 		return view{}, nil, err
 	}
 	unlock := d.kl.lock(keys...)
+	if !needView {
+		d.mu.RLock()
+		closed := d.closed
+		d.mu.RUnlock()
+		if closed {
+			unlock()
+			return view{}, nil, ErrClosed
+		}
+		return view{}, unlock, nil
+	}
 	v, err := d.view()
 	if err != nil {
 		unlock()
@@ -780,23 +796,32 @@ func (d *DB) beginWrite(keys ...[]byte) (view, func(), error) {
 }
 
 func (d *DB) Set(key, value []byte, opt SetOptions) (bool, error) {
-	v, done, err := d.beginWrite(key)
+	// A plain SET (no NX/XX/KEEPTTL) does not depend on the current value, so it
+	// must not pay for a lookup: that read would probe the memtables, the Bloom
+	// filters and possibly an SSTable block on every single write. (A CPU
+	// profile of the write benchmark showed ~34% of time in exactly that read.)
+	// The stripe lock is still taken so the write is ordered against INCR/EXPIRE
+	// on the same key.
+	needRead := opt.NX || opt.XX || opt.KeepTTL
+	v, done, err := d.beginWriteMode(needRead, key)
 	if err != nil {
 		return false, err
 	}
 	defer done()
-	old, exists, err := v.live(key)
-	if err != nil {
-		return false, err
-	}
-	if (opt.NX && exists) || (opt.XX && !exists) {
-		return false, nil
-	}
 	exp := opt.ExpireAtMs
-	if opt.KeepTTL {
-		exp = 0
-		if exists {
-			exp = old.ExpireAt
+	if needRead {
+		old, exists, err := v.live(key)
+		if err != nil {
+			return false, err
+		}
+		if (opt.NX && exists) || (opt.XX && !exists) {
+			return false, nil
+		}
+		if opt.KeepTTL {
+			exp = 0
+			if exists {
+				exp = old.ExpireAt
+			}
 		}
 	}
 	err = d.commit([]wal.Op{{Type: wal.OpPut, Key: key, Value: value, ExpireAt: exp}})

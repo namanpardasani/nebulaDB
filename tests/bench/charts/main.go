@@ -151,6 +151,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, "skip", suite.file, ":", err)
 			continue
 		}
+		// Repeated runs (embedded-r2.jsonl, embedded-r3.jsonl, ...) are merged to medians.
+		runs := [][]benchutil.Result{rs}
+		for _, extra := range func() []string {
+			m, _ := filepath.Glob(filepath.Join(*res, strings.TrimSuffix(suite.file, ".jsonl")+"-r*.jsonl"))
+			sort.Strings(m)
+			return m
+		}() {
+			if r2, err := benchutil.Load(extra); err == nil {
+				runs = append(runs, r2)
+			}
+		}
+		rs = benchutil.Merge(runs...)
 		workloads := map[string]bool{}
 		for _, r := range rs {
 			workloads[r.Workload] = true
@@ -184,7 +196,13 @@ func main() {
 					famsSeen[f] = [...]string{"NebulaDB", "Redis 8", "Pebble v2", "BadgerDB v4"}[f]
 					thr = append(thr, bar{r.Target, r.OpsPerSec, f, fmtNum(r.OpsPerSec, "")})
 					lat = append(lat, bar{r.Target, r.P99Us, f, fmtNum(r.P99Us, "us")})
-					fmt.Fprintf(&md, "| %s | %s | %d | %.0f | %.0f µs | %.0f µs | %.0f µs | %.0f µs |\n", w, r.Target, c, r.OpsPerSec, r.MeanUs, r.P50Us, r.P99Us, r.P999Us)
+					spread := ""
+					if n, _ := r.Extra["runs"].(int); n > 1 {
+						lo, _ := r.Extra["ops_min"].(float64)
+						hi, _ := r.Extra["ops_max"].(float64)
+						spread = fmt.Sprintf(" (%d runs: %.0f–%.0f)", n, lo, hi)
+					}
+					fmt.Fprintf(&md, "| %s | %s | %d | %.0f%s | %.0f µs | %.0f µs | %.0f µs | %.0f µs |\n", w, r.Target, c, r.OpsPerSec, spread, r.MeanUs, r.P50Us, r.P99Us, r.P999Us)
 				}
 				x := 24 + float64(ci)*colW
 				h1 := panel(&body, x, y, colW-24, fmt.Sprintf("Throughput, %d %s", c, suite.unitWord), "operations per second (higher is better)", thr, "", false)
@@ -213,27 +231,32 @@ func main() {
 
 	// ---- amplification
 	if rs, err := benchutil.Load(filepath.Join(*res, "amp.jsonl")); err == nil && len(rs) > 0 {
-		fmt.Fprintf(&md, "\n### Write / space / read amplification\n\n| target | write amp (OS bytes written / user bytes) | space amp (directory / live data) | blocks looked up per get | disk blocks read per get | tables | compactions |\n|---|---|---|---|---|---|---|\n")
-		var wa, sa, ra []bar
+		fmt.Fprintf(&md, "\n### Write / space / read amplification\n\n| target | write amp, engine-accounted (WAL+flush+compaction / user bytes) | write amp, device after sync | space amp (allocated dir / live data) | blocks looked up per get | disk blocks read per get | tables | compactions |\n|---|---|---|---|---|---|---|---|\n")
+		var we, wd, sa, ra []bar
 		for _, r := range rs {
 			f := family(r.Target)
-			w, _ := r.Extra["write_amp_os"].(float64)
+			e, eok := r.Extra["write_amp_engine"].(float64)
+			d, _ := r.Extra["write_amp_disk"].(float64)
 			s, _ := r.Extra["space_amp"].(float64)
-			wa = append(wa, bar{r.Target, w, f, fmt.Sprintf("%.1f×", w)})
+			if eok {
+				we = append(we, bar{r.Target, e, f, fmt.Sprintf("%.1f×", e)})
+			}
+			wd = append(wd, bar{r.Target, d, f, fmt.Sprintf("%.1f×", d)})
 			sa = append(sa, bar{r.Target, s, f, fmt.Sprintf("%.2f×", s)})
 			rd, rok := r.Extra["read_amp_blocks_per_get"].(float64)
 			rdd, _ := r.Extra["read_amp_disk_blocks_per_get"].(float64)
 			if rok {
 				ra = append(ra, bar{r.Target, rd, f, fmt.Sprintf("%.2f", rd)})
 			}
-			fmt.Fprintf(&md, "| %s | %.2f | %.2f | %s | %s | %v | %v |\n", r.Target, w, s,
+			fmt.Fprintf(&md, "| %s | %s | %.2f | %.2f | %s | %s | %v | %v |\n", r.Target, ifOK(eok, fmt.Sprintf("%.2f", e)), d, s,
 				ifOK(rok, fmt.Sprintf("%.2f", rd)), ifOK(rok, fmt.Sprintf("%.3f", rdd)), r.Extra["table_files"], r.Extra["compactions"])
 		}
 		var body strings.Builder
-		h1 := panel(&body, 24, 70, 540, "Write amplification", "bytes the process wrote to disk ÷ bytes of user data (lower is better)", wa, "", true)
-		panel(&body, 24, 70+h1+20, 540, "Space amplification", "directory size ÷ logical live data (lower is better)", sa, "", true)
+		h1 := panel(&body, 24, 70, 540, "Write amplification (engine-accounted)", "WAL + flush + compaction bytes ÷ user bytes; Badger exposes no such counter", we, "", true)
+		panel(&body, 24, 70+h1+20, 540, "Space amplification", "allocated directory size ÷ logical live data (lower is better)", sa, "", true)
+		panel(&body, 580, 70, 540, "Device bytes written ÷ user bytes", "block-device sectors written after a forced sync (kernel may skip short-lived files)", wd, "", true)
 		if len(ra) > 0 {
-			panel(&body, 580, 70, 540, "Read amplification (NebulaDB)", "data-block lookups per Get (lower is better)", ra, "", true)
+			panel(&body, 580, 70+h1+20, 540, "Read amplification (NebulaDB)", "data-block lookups per Get (lower is better)", ra, "", true)
 		}
 		var hdr strings.Builder
 		fmt.Fprintf(&hdr, `<text x="24" y="30" class="t1" font-size="17" font-weight="700">Amplification after a random-overwrite workload</text>`)

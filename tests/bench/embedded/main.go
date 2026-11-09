@@ -21,14 +21,17 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 
 	"github.com/naman/nebuladb/pkg/nebuladb"
 	"github.com/naman/nebuladb/tests/bench/benchutil"
@@ -41,6 +44,10 @@ type store interface {
 	ScanKeys(start []byte, n int) (int, error)
 	Settle() error // wait for background flush/compaction to go idle
 	Stats() map[string]any
+	// Amp returns the engine's own accounting: physical bytes written (WAL +
+	// flush + compaction output) and logical bytes accepted. ok is false when the
+	// engine does not expose it (Badger).
+	Amp() (physical, logical float64, ok bool)
 	Close() error
 }
 
@@ -94,6 +101,11 @@ func (n *nebula) Stats() map[string]any {
 	}
 	return m
 }
+func (n *nebula) Amp() (float64, float64, bool) {
+	st := n.db.Stats()
+	f := func(k string) float64 { v, _ := strconv.ParseFloat(st[k], 64); return v }
+	return f("wal_bytes_written") + f("flush_bytes") + f("compaction_bytes_written"), f("user_bytes_written"), true
+}
 func (n *nebula) Close() error { return n.db.Close() }
 
 // ---------------------------------------------------------------- Pebble
@@ -107,7 +119,12 @@ type pebbleStore struct {
 func openPebble(dir string, sync bool) (store, error) {
 	c := pebble.NewCache(cacheBytes)
 	defer c.Unref()
-	db, err := pebble.Open(dir, &pebble.Options{Cache: c, MemTableSize: memtableBytes})
+	opts := &pebble.Options{Cache: c, MemTableSize: memtableBytes}
+	// Compression is disabled in every engine: the comparison is about storage
+	// engine design (WAL, memtable, compaction, indexing), not codec choice, and
+	// NebulaDB stores blocks uncompressed.
+	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings { return pebble.DBCompressionNone })
+	db, err := pebble.Open(dir, opts)
 	wo := pebble.NoSync
 	if sync {
 		wo = pebble.Sync
@@ -161,6 +178,11 @@ func (p *pebbleStore) Stats() map[string]any {
 	m := p.db.Metrics()
 	return map[string]any{"pebble_compactions": m.Compact.Count, "pebble_flushes": m.Flush.Count}
 }
+func (p *pebbleStore) Amp() (float64, float64, bool) {
+	m := p.db.Metrics()
+	t := m.Total()
+	return float64(m.WAL.BytesWritten + t.TableBytesFlushed + t.TableBytesCompacted), float64(m.WAL.BytesIn), true
+}
 func (p *pebbleStore) Close() error { return p.db.Close() }
 
 // ---------------------------------------------------------------- Badger
@@ -169,7 +191,10 @@ type badgerStore struct{ db *badger.DB }
 
 func openBadger(dir string, sync bool) (store, error) {
 	o := badger.DefaultOptions(dir).WithSyncWrites(sync).WithLogger(nil).
-		WithBlockCacheSize(cacheBytes).WithIndexCacheSize(cacheBytes).WithMemTableSize(memtableBytes)
+		WithBlockCacheSize(cacheBytes).WithIndexCacheSize(cacheBytes).WithMemTableSize(memtableBytes).WithCompression(options.None).
+		// Badger rejects a value threshold above ~15% of the memtable; 512 KiB keeps
+		// the 100-byte benchmark values inside the LSM tree, as in the other engines.
+		WithValueThreshold(512 << 10)
 	db, err := badger.Open(o)
 	return &badgerStore{db}, err
 }
@@ -215,7 +240,8 @@ func (b *badgerStore) Stats() map[string]any {
 	lsm, vlog := b.db.Size()
 	return map[string]any{"badger_lsm_bytes": lsm, "badger_vlog_bytes": vlog}
 }
-func (b *badgerStore) Close() error { return b.db.Close() }
+func (b *badgerStore) Amp() (float64, float64, bool) { return 0, 0, false }
+func (b *badgerStore) Close() error                  { return b.db.Close() }
 
 // ---------------------------------------------------------------- workloads
 
@@ -226,26 +252,46 @@ func keyOf(i int) []byte {
 	return k
 }
 
-func procWriteBytes() uint64 {
-	f, err := os.Open("/proc/self/io")
+// diskWriteBytes returns the cumulative bytes written to the block device that
+// holds `path`, from /proc/diskstats (sectors written x 512). It is system-wide,
+// so it is only meaningful on an otherwise idle machine; per-process counters
+// (/proc/self/io) read zero under WSL2. It includes filesystem journal and
+// metadata writes, which every engine pays equally.
+func diskWriteBytes(path string) uint64 {
+	var st syscall.Stat_t
+	if syscall.Stat(path, &st) != nil {
+		return 0
+	}
+	dev := uint64(st.Dev)
+	major := (dev>>8)&0xfff | (dev>>32)&^uint64(0xfff)
+	minor := dev&0xff | (dev>>12)&^uint64(0xff)
+	f, err := os.Open("/proc/diskstats")
 	if err != nil {
 		return 0
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		if strings.HasPrefix(sc.Text(), "write_bytes:") {
-			v, _ := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(sc.Text(), "write_bytes:")), 10, 64)
-			return v
+		fl := strings.Fields(sc.Text())
+		if len(fl) > 9 && fl[0] == strconv.FormatUint(major, 10) && fl[1] == strconv.FormatUint(minor, 10) {
+			sectors, _ := strconv.ParseUint(fl[9], 10, 64)
+			return sectors * 512
 		}
 	}
 	return 0
 }
 
+// dirBytes is the space the directory actually occupies on disk (allocated
+// blocks, like `du`), not the apparent file sizes: Badger preallocates sparse
+// ~1 GB value-log files whose apparent size says nothing about real usage.
 func dirBytes(dir string) (n int64) {
 	filepath.Walk(dir, func(_ string, fi os.FileInfo, err error) error {
 		if err == nil && !fi.IsDir() {
-			n += fi.Size()
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				n += st.Blocks * 512
+			} else {
+				n += fi.Size()
+			}
 		}
 		return nil
 	})
@@ -265,6 +311,7 @@ func main() {
 	ops := flag.Int("ops", 500000, "overwrites for the amp workload")
 	dir := flag.String("dir", "", "data directory (default: temp under ./bin)")
 	out := flag.String("out", "", "append JSON result here")
+	cpuprof := flag.String("cpuprofile", "", "write a CPU profile of the measured window")
 	label := flag.String("label", "", "target label (default engine[-sync])")
 	flag.Parse()
 
@@ -376,11 +423,17 @@ func main() {
 		}(t)
 	}
 	time.Sleep(*warm)
+	if *cpuprof != "" {
+		if f, err := os.Create(*cpuprof); err == nil {
+			pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
+	}
 	measuring.Store(true)
-	w0, t0 := procWriteBytes(), time.Now()
+	w0, t0 := diskWriteBytes(*dir), time.Now()
 	time.Sleep(*dur)
 	measuring.Store(false)
-	elapsed, w1 := time.Since(t0), procWriteBytes()
+	elapsed, w1 := time.Since(t0), diskWriteBytes(*dir)
 	stop.Store(true)
 	wg.Wait()
 	var all []time.Duration
@@ -402,7 +455,8 @@ func main() {
 // allowed to settle and we compare what the process wrote to disk and what is
 // stored against the logical data.
 func runAmp(s store, name, dir string, keys, ops int, val []byte, eng, style, out string) {
-	w0 := procWriteBytes()
+	syscall.Sync() // writeback of anything pending, so only this run is counted
+	w0 := diskWriteBytes(dir)
 	t0 := time.Now()
 	rng := rand.New(rand.NewSource(3))
 	var user int64
@@ -415,14 +469,20 @@ func runAmp(s store, name, dir string, keys, ops int, val []byte, eng, style, ou
 		user += int64(12 + len(val))
 	}
 	s.Settle()
+	syscall.Sync() // force this run's dirty pages to the device before reading the counter
 	elapsed := time.Since(t0)
-	written := procWriteBytes() - w0
+	written := diskWriteBytes(dir) - w0
 	live := int64(keys) * int64(12+len(val))
 	size := dirBytes(dir)
 	extra := map[string]any{
 		"engine": eng, "user_bytes": user, "live_bytes": live, "disk_write_bytes": written, "dir_bytes": size,
-		"write_amp_os": float64(written) / float64(user), "space_amp": float64(size) / float64(live), "seconds_total": elapsed.Seconds(),
+		"write_amp_disk": float64(written) / float64(user), "space_amp": float64(size) / float64(live), "seconds_total": elapsed.Seconds(),
 		"keys": keys, "overwrites": ops,
+	}
+	if phys, logi, ok := s.Amp(); ok && logi > 0 {
+		extra["write_amp_engine"] = phys / logi
+		extra["engine_physical_bytes"] = phys
+		extra["engine_logical_bytes"] = logi
 	}
 	for k, v := range s.Stats() {
 		extra[k] = v
@@ -445,8 +505,12 @@ func runAmp(s store, name, dir string, keys, ops int, val []byte, eng, style, ou
 	}
 	r := benchutil.Result{Suite: "amp", Target: name, Workload: "amp", Extra: extra}
 	benchutil.Summarize(&r, nil, elapsed)
-	fmt.Printf("%-24s write_amp(os)=%.2f space_amp=%.2f  disk_written=%.1fMiB dir=%.1fMiB live=%.1fMiB  %.1fs\n",
-		name, extra["write_amp_os"], extra["space_amp"], float64(written)/1048576, float64(size)/1048576, float64(live)/1048576, elapsed.Seconds())
+	eng2 := "n/a"
+	if v, ok := extra["write_amp_engine"].(float64); ok {
+		eng2 = fmt.Sprintf("%.2f", v)
+	}
+	fmt.Printf("%-24s write_amp(engine)=%s write_amp(device,after sync)=%.2f space_amp=%.2f  device_written=%.1fMiB dir=%.1fMiB live=%.1fMiB  %.1fs\n",
+		name, eng2, extra["write_amp_disk"], extra["space_amp"], float64(written)/1048576, float64(size)/1048576, float64(live)/1048576, elapsed.Seconds())
 	if rb, ok := extra["read_amp_blocks_per_get"]; ok {
 		fmt.Printf("%-24s read_amp: %.2f block lookups per get (%.3f disk block reads per get), tables=%v\n", "", rb, extra["read_amp_disk_blocks_per_get"], extra["table_files"])
 	}

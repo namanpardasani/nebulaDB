@@ -88,3 +88,69 @@ func Load(path string) ([]Result, error) {
 	}
 	return out, nil
 }
+
+// Merge combines repeated runs of the same cell (same suite, target, workload
+// and concurrency) into one Result holding the MEDIAN of every statistic. The
+// extra fields "runs", "ops_min" and "ops_max" record how many runs there were
+// and the spread of throughput, so tables can show the variance honestly.
+func Merge(runs ...[]Result) []Result {
+	type key struct {
+		suite, target, workload string
+		conns                   int
+	}
+	groups := map[key][]Result{}
+	var order []key
+	for _, rs := range runs {
+		for _, r := range rs {
+			k := key{r.Suite, r.Target, r.Workload, r.Conns}
+			if _, ok := groups[k]; !ok {
+				order = append(order, k)
+			}
+			groups[k] = append(groups[k], r)
+		}
+	}
+	med := func(vals []float64) float64 {
+		sort.Float64s(vals)
+		n := len(vals)
+		if n%2 == 1 {
+			return vals[n/2]
+		}
+		return (vals[n/2-1] + vals[n/2]) / 2
+	}
+	var out []Result
+	for _, k := range order {
+		g := groups[k]
+		pick := func(f func(Result) float64) float64 {
+			v := make([]float64, len(g))
+			for i, r := range g {
+				v[i] = f(r)
+			}
+			return med(v)
+		}
+		m := g[0]
+		m.OpsPerSec = pick(func(r Result) float64 { return r.OpsPerSec })
+		m.MeanUs = pick(func(r Result) float64 { return r.MeanUs })
+		m.P50Us = pick(func(r Result) float64 { return r.P50Us })
+		m.P90Us = pick(func(r Result) float64 { return r.P90Us })
+		m.P99Us = pick(func(r Result) float64 { return r.P99Us })
+		m.P999Us = pick(func(r Result) float64 { return r.P999Us })
+		m.MaxUs = pick(func(r Result) float64 { return r.MaxUs })
+		lo, hi := g[0].OpsPerSec, g[0].OpsPerSec
+		for _, r := range g {
+			if r.OpsPerSec < lo {
+				lo = r.OpsPerSec
+			}
+			if r.OpsPerSec > hi {
+				hi = r.OpsPerSec
+			}
+		}
+		extra := map[string]any{}
+		for kk, vv := range m.Extra {
+			extra[kk] = vv
+		}
+		extra["runs"], extra["ops_min"], extra["ops_max"] = len(g), lo, hi
+		m.Extra = extra
+		out = append(out, m)
+	}
+	return out
+}

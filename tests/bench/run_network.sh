@@ -14,7 +14,20 @@ WARMUP=${WARMUP:-2}
 KEYS=${KEYS:-50000}
 RES=tests/bench/results
 mkdir -p "$RES/redis-benchmark" bin/bench-data
-: > "$RES/network.jsonl"
+# ONLY="name name" re-measures just those targets; APPEND=1 keeps the other rows.
+want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
+if [ "${APPEND:-0}" = 1 ]; then
+  python3 -I - "$RES" "${ONLY:-}" <<'PY'
+import json,sys
+res,only=sys.argv[1],sys.argv[2].split()
+keep=[l for l in open(res+"/network.jsonl") if json.loads(l)["target"] not in only]
+open(res+"/network.jsonl","w").writelines(keep)
+rows=[l for l in open(res+"/redis-benchmark/all.csv") if l.split(",")[0] not in only]
+open(res+"/redis-benchmark/all.csv","w").writelines(rows)
+PY
+else
+  : > "$RES/network.jsonl"
+fi
 go build -o bin/nebuladb ./cmd/nebuladb
 (cd tests/bench && go build -o ../../bin/loadgen ./loadgen)
 REDIS=$ROOT/bin/redis/redis-server
@@ -36,14 +49,38 @@ start_redis() { # name port extra-flags...
 wait_ready() { for _ in $(seq 1 100); do redis-cli -p $1 PING >/dev/null 2>&1 && return 0; sleep 0.1; done; echo "server on $1 did not start"; exit 1; }
 stop_server() { kill -TERM $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; PID=""; }
 
+# settle waits until NebulaDB has no background work left (no immutable memtables,
+# L0 below its trigger, compaction counter unchanged for 3 s) so every cell starts
+# from a quiet tree; a write-heavy cell otherwise leaves a compaction backlog that
+# would depress the NEXT cell and make results depend on cell order. It logs how
+# long the backlog took to clear. Redis has no equivalent (AOF rewrite is not
+# triggered at these sizes), so this is a no-op for it.
+settle() { # port
+  redis-cli -p $1 INFO 2>/dev/null | grep -q nebuladb_version || return 0
+  local t0=$(date +%s.%N) last="" stable=0
+  for _ in $(seq 1 240); do
+    local info=$(redis-cli -p $1 INFO)
+    local comp=$(echo "$info" | grep '^compactions:' | cut -d: -f2 | tr -d '\r')
+    local imm=$(echo "$info" | grep '^immutable_memtables:' | cut -d: -f2 | tr -d '\r')
+    local l0=$(echo "$info" | grep '^l0_files:' | cut -d: -f2 | tr -d '\r')
+    if [ "$comp" = "$last" ] && [ "$imm" = "0" ] && [ "${l0:-0}" -le 3 ]; then stable=$((stable+1)); else stable=0; fi
+    last=$comp
+    [ $stable -ge 3 ] && break
+    sleep 1
+  done
+  echo "    (settled in $(printf '%.0f' $(echo "$(date +%s.%N) - $t0" | bc)) s)"
+}
+
 run_target() { # name port rbn  (rbn = redis-benchmark request count)
   local name=$1 port=$2 rbn=$3
   wait_ready $port
   echo "=== $name (port $port)"
   ./bin/loadgen -addr 127.0.0.1:$port -workload preload -keys $KEYS
+  settle $port
   for w in write read mixed large scan; do
     for c in 1 32; do
       # the single-connection fsync-per-write configs are slow by design; keep their cells short but still >= 3 s
+      settle $port
       ./bin/loadgen -addr 127.0.0.1:$port -target "$name" -workload $w -conns $c -duration ${DURATION}s -warmup ${WARMUP}s -keys $KEYS -out "$RES/network.jsonl"
     done
   done
@@ -55,19 +92,19 @@ run_target() { # name port rbn  (rbn = redis-benchmark request count)
   if redis-cli -p $port INFO 2>/dev/null | grep -q nebuladb_version; then redis-cli -p $port INFO > "$RES/info-$name.txt"; fi
 }
 
-: > "$RES/redis-benchmark/all.csv"
+[ "${APPEND:-0}" = 1 ] || : > "$RES/redis-benchmark/all.csv"
 # ---- NebulaDB
-start_nebula nebuladb-always 6501 -fsync always;                      run_target nebuladb-always 6501 50000; stop_server
-start_nebula nebuladb-always-nogc 6502 -fsync always -group-commit=false; run_target nebuladb-always-nogc 6502 4000; stop_server
-start_nebula nebuladb-every 6503 -fsync every -fsync-interval 1s;      run_target nebuladb-every 6503 50000; stop_server
-start_nebula nebuladb-never 6504 -fsync never;                         run_target nebuladb-never 6504 50000; stop_server
+want nebuladb-always && { start_nebula nebuladb-always 6501 -fsync always;                      run_target nebuladb-always 6501 50000; stop_server; }
+want nebuladb-always-nogc && { start_nebula nebuladb-always-nogc 6502 -fsync always -group-commit=false; run_target nebuladb-always-nogc 6502 4000; stop_server; }
+want nebuladb-every && { start_nebula nebuladb-every 6503 -fsync every -fsync-interval 1s;      run_target nebuladb-every 6503 50000; stop_server; }
+want nebuladb-never && { start_nebula nebuladb-never 6504 -fsync never;                         run_target nebuladb-never 6504 50000; stop_server; }
 # ---- Redis (same server binary the official image ships, run natively)
-start_redis redis-aof-always 6511 --appendonly yes --appendfsync always;     run_target redis-aof-always 6511 50000; stop_server
-start_redis redis-aof-everysec 6512 --appendonly yes --appendfsync everysec; run_target redis-aof-everysec 6512 50000; stop_server
-start_redis redis-nopersist 6513 --appendonly no;                            run_target redis-nopersist 6513 50000; stop_server
+want redis-aof-always && { start_redis redis-aof-always 6511 --appendonly yes --appendfsync always;     run_target redis-aof-always 6511 50000; stop_server; }
+want redis-aof-everysec && { start_redis redis-aof-everysec 6512 --appendonly yes --appendfsync everysec; run_target redis-aof-everysec 6512 50000; stop_server; }
+want redis-nopersist && { start_redis redis-nopersist 6513 --appendonly no;                            run_target redis-nopersist 6513 50000; stop_server; }
 # ---- Redis inside Docker (Docker Desktop publishes ports through a proxy: shows that overhead).
 # Skipped automatically if the Docker daemon is not running.
-if docker version >/dev/null 2>&1; then
+if want redis-docker-nopersist && docker version >/dev/null 2>&1; then
   docker rm -f nebula-bench-redis >/dev/null 2>&1 || true
   docker run -d --rm --name nebula-bench-redis -p 127.0.0.1:6514:6379 redis:8 redis-server --appendonly no --save "" >/dev/null
   wait_ready 6514
