@@ -28,6 +28,12 @@ func main() {
 }
 
 func run() error {
+	for _, a := range os.Args[1:] {
+		if a == "-version" || a == "--version" {
+			fmt.Println("nebuladb", server.Version)
+			return nil
+		}
+	}
 	cfg, err := config.Parse(os.Args[1:], os.Stderr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

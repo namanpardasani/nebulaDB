@@ -1,0 +1,35 @@
+# NebulaDB + Inspector on your machine:
+#   docker compose up --build
+#   redis-cli -p 6380 SET hello world        # the database
+#   open http://localhost:8080               # the Inspector
+#
+# Change host ports if they are taken: NEBULA_PORT=16380 NEBULA_ADMIN_PORT=17380 INSPECTOR_PORT=18080 docker compose up
+# (the Inspector reaches the admin API at 127.0.0.1:7380 by default; if you change
+# NEBULA_ADMIN_PORT open it as http://localhost:18080/?admin=http://127.0.0.1:17380)
+#
+# Ports are published to 127.0.0.1 ONLY: the admin port has no authentication
+# (it exposes a command proxy), so it must not be reachable from the network.
+services:
+  nebuladb:
+    build: .
+    image: nebuladb:local
+    command:
+      - -dir=/data
+      - -addr=0.0.0.0:6380
+      - -admin-addr=0.0.0.0:7380
+      - -dev                      # enables flush/compact in the Inspector (the crash button needs -supervise, see docs/INSTALL.md)
+    ports:
+      - "127.0.0.1:${NEBULA_PORT:-6380}:6380"
+      - "127.0.0.1:${NEBULA_ADMIN_PORT:-7380}:7380"
+    volumes:
+      - nebula-data:/data
+    restart: unless-stopped
+  inspector:
+    build: ./inspector
+    image: nebuladb-inspector:local
+    ports:
+      - "127.0.0.1:${INSPECTOR_PORT:-8080}:80"
+    depends_on:
+      - nebuladb
+volumes:
+  nebula-data:

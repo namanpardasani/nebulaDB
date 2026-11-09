@@ -1,0 +1,12 @@
+.git
+bin
+dist
+data
+tmp
+docs
+design
+tests
+inspector/node_modules
+inspector/dist
+inspector/screenshots
+*.md

@@ -1,4 +1,4 @@
-.PHONY: build test race fuzz crash model bench inspector lint vet fmt
+.PHONY: build test race fuzz crash model bench inspector lint vet fmt release docker repl
 
 GO ?= go
 BIN := bin
@@ -42,3 +42,14 @@ inspector:
 
 lint: vet fmt
 	@which staticcheck >/dev/null 2>&1 && staticcheck ./... || echo "staticcheck not installed; skipped (CI runs it)"
+
+# Release archives for 6 OS/arch targets in dist/ (nothing is published).
+release:
+	./scripts/release.sh $(VERSION)
+
+docker:
+	docker build -t nebuladb:local --build-arg VERSION=$${VERSION:-dev} .
+
+# Replication kill tests (spawn real servers; ~90 s).
+repl:
+	$(GO) test ./tests/repl -count=1 -v

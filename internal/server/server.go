@@ -29,8 +29,9 @@ import (
 	"github.com/naman/nebuladb/internal/resp"
 )
 
-// Version is reported by INFO and HELLO.
-const Version = "0.1.0-dev"
+// Version is reported by INFO and HELLO. A variable (not a constant) so release
+// builds can stamp it: -ldflags "-X github.com/naman/nebuladb/internal/server.Version=1.2.3".
+var Version = "0.1.0-dev"
 
 // Options configures a Server.
 type Options struct {
