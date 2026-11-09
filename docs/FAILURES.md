@@ -245,5 +245,5 @@ Tests: `internal/repl/repl_test.go` (in-process) and `tests/repl/kill_test.go` (
 | Different leader (new data directory) at the same address | Identity mismatch: follower wipes and resyncs, so a deposed leader's unreplicated writes are discarded | `TestNewLeaderDirectoryForcesResyncAndWipesOldData` |
 | Corrupted frame on the wire | CRC32C mismatch closes the connection; every single-bit flip of a frame is detected | `TestProtocolRejectsCorruptionAndGarbage`, `FuzzDecodeBatch` |
 | Sync ack does not arrive in time | Write applied on the leader but the client gets an error: outcome unknown | `TestSyncAcksMeanDurableOnReplicaBeforeReply` |
-| Follower power loss with `-fsync every|never` | Its position file (fsynced) can be ahead of its WAL: use `-fsync always` on followers you may promote | documented limitation |
+| Follower power loss with `-fsync every` or `never` | Its position file (fsynced) can be ahead of its WAL: use `-fsync always` on followers you may promote | documented limitation |
 | Network partition / two writable leaders | **Not handled** (no consensus, no fencing) | documented limitation |
