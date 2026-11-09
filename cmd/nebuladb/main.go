@@ -14,6 +14,7 @@ import (
 	"github.com/naman/nebuladb/internal/config"
 	"github.com/naman/nebuladb/internal/engine"
 	"github.com/naman/nebuladb/internal/logx"
+	"github.com/naman/nebuladb/internal/repl"
 	"github.com/naman/nebuladb/internal/server"
 	"github.com/naman/nebuladb/internal/vfs"
 	"github.com/naman/nebuladb/internal/wal"
@@ -43,6 +44,11 @@ func run() error {
 	broker := admin.NewBroker(2000) // engine events -> SSE stream
 
 	var eng engine.Engine
+	var rawDB *engine.DB // the LSM engine itself (the admin server needs it even when eng is a replication wrapper)
+	var leader *repl.Leader
+	var follower *repl.Follower
+	followCtx, stopFollow := context.WithCancel(context.Background())
+	defer stopFollow()
 	if cfg.InMemory {
 		eng = engine.NewMem()
 		log.Warn("running WITHOUT persistence (-in-memory): data is lost on exit")
@@ -59,8 +65,20 @@ func run() error {
 		if cacheBytes == 0 {
 			cacheBytes = -1 // -cache-size=0 disables the cache
 		}
+		var onCommit func(uint64, []wal.Op)
+		if cfg.ReplListen != "" {
+			if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+				return err
+			}
+			leader, err = repl.NewLeader(cfg.Dir, cfg.ReplBacklog, log)
+			if err != nil {
+				return err
+			}
+			onCommit = leader.OnCommit
+		}
 		db, info, err := engine.Open(engine.Options{
-			FS: vfs.Default, Dir: cfg.Dir,
+			OnCommit: onCommit,
+			FS:       vfs.Default, Dir: cfg.Dir,
 			Sync: policy, SyncEvery: cfg.FsyncInterval, GroupCommit: cfg.GroupCommit,
 			MemtableSize: cfg.MemtableSize, MaxImmutables: cfg.MaxImmutables, OnEvent: broker.Publish,
 			BlockSize: cfg.BlockSize, BloomBits: cfg.BloomBitsKey, BlockCacheBytes: cacheBytes, Logger: log,
@@ -73,7 +91,30 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("recovery failed: %w", err)
 		}
-		eng = db
+		eng, rawDB = db, db
+		switch {
+		case leader != nil:
+			leader.Attach(db)
+			rln, err := net.Listen("tcp", cfg.ReplListen)
+			if err != nil {
+				return fmt.Errorf("replication listener: %w", err)
+			}
+			go func() {
+				if err := leader.Serve(rln); err != nil {
+					log.Error("replication server stopped", "err", err)
+				}
+			}()
+			eng = &repl.SyncEngine{Engine: db, L: leader, MinAcks: cfg.ReplMinAcks, Wait: cfg.ReplAckWait}
+			log.Info("replication: serving followers", "addr", rln.Addr().String(), "min_acks", cfg.ReplMinAcks)
+		case cfg.ReplicaOf != "":
+			follower, err = repl.NewFollower(db, cfg.Dir, cfg.ReplicaOf, log)
+			if err != nil {
+				return err
+			}
+			go follower.Run(followCtx)
+			eng = repl.ReadOnly{Engine: db, F: follower}
+			log.Info("running as a read-only replica", "leader", cfg.ReplicaOf, "applied_seq", follower.Pos())
+		}
 		log.Info("recovery complete", "dir", cfg.Dir, "wal_segments", len(info.Segments), "batches", info.Batches,
 			"last_seq", info.LastSeq, "torn_tail", info.TornTail, "truncated_bytes", info.TruncatedBytes)
 	}
@@ -88,8 +129,8 @@ func run() error {
 	var adm *admin.Server
 	if cfg.AdminAddr != "" {
 		aopts := admin.Options{Server: srv, Broker: broker, ServerAddr: ln.Addr().String(), DevMode: cfg.DevMode || supervised, Supervised: supervised}
-		if db, ok := eng.(*engine.DB); ok {
-			aopts.Source, aopts.Dev = db, db
+		if rawDB != nil {
+			aopts.Source, aopts.Dev = rawDB, rawDB
 		}
 		host, _, _ := net.SplitHostPort(cfg.AdminAddr)
 		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
@@ -133,6 +174,13 @@ func run() error {
 	}
 	if adm != nil {
 		adm.Shutdown(ctx)
+	}
+	stopFollow()
+	if follower != nil {
+		follower.Wait()
+	}
+	if leader != nil {
+		leader.Close()
 	}
 	if err := eng.Close(); err != nil {
 		return fmt.Errorf("closing engine: %w", err)

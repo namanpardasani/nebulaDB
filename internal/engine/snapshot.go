@@ -54,14 +54,15 @@ func (s *Snapshot) NewIterator() *Iter {
 	return &Iter{v: iterator.NewView(s.v.newMerged(), s.v.snap, s.v.now)}
 }
 
-func (it *Iter) SeekToFirst()  { it.v.SeekToFirst() }
-func (it *Iter) Seek(k []byte) { it.v.Seek(k) }
-func (it *Iter) Next()         { it.v.Next() }
-func (it *Iter) Valid() bool   { return it.v.Valid() }
-func (it *Iter) Key() []byte   { return it.v.Key() }
-func (it *Iter) Value() []byte { return it.v.Value() }
-func (it *Iter) Err() error    { return it.v.Err() }
-func (it *Iter) Close() error  { return it.v.Close() }
+func (it *Iter) SeekToFirst()    { it.v.SeekToFirst() }
+func (it *Iter) Seek(k []byte)   { it.v.Seek(k) }
+func (it *Iter) Next()           { it.v.Next() }
+func (it *Iter) Valid() bool     { return it.v.Valid() }
+func (it *Iter) Key() []byte     { return it.v.Key() }
+func (it *Iter) Value() []byte   { return it.v.Value() }
+func (it *Iter) ExpireAt() int64 { return it.v.ExpireAt() }
+func (it *Iter) Err() error      { return it.v.Err() }
+func (it *Iter) Close() error    { return it.v.Close() }
 
 // Close releases the pinned files. It is safe to call more than once.
 func (s *Snapshot) Close() { s.once.Do(s.v.release) }

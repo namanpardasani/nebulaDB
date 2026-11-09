@@ -16,6 +16,8 @@ import (
 var (
 	// ErrNotInteger: value is not a base-10 int64 (INCR on text).
 	ErrNotInteger = errors.New("value is not an integer or out of range")
+	// ErrReadOnly is returned by a replica for write commands.
+	ErrReadOnly = errors.New("READONLY You can't write against a read only replica.")
 	// ErrClosed is returned after Close.
 	ErrClosed = errors.New("engine closed")
 )

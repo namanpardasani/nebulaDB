@@ -57,6 +57,13 @@ type Options struct {
 	Now     func() int64 // unix ms clock; nil = wall clock
 	Logger  *slog.Logger
 	OnEvent func(Event) // optional engine event sink (must not block)
+
+	// OnCommit, if set, is called for every committed batch on the WAL leader, in
+	// sequence order, after the batch is durable (per the fsync policy) and
+	// applied. first is the sequence number of ops[0]. It must be fast, must not
+	// block and must copy anything it keeps (ops alias caller memory). Used by
+	// replication to build the log it ships.
+	OnCommit func(first uint64, ops []wal.Op)
 }
 
 func (o *Options) fill() {
@@ -357,9 +364,27 @@ func (d *DB) commit(ops []wal.Op) error {
 		d.insert(first, ops)
 		d.recordSample(first, ops[0].Key, len(ops[0].Value), ops[0].Type == wal.OpDelete)
 		d.visible.Store(first + uint64(len(ops)) - 1)
+		if d.opts.OnCommit != nil {
+			d.opts.OnCommit(first, ops)
+		}
 		// NOT rotating here: see wal.Options.AfterGroup.
 	})
 }
+
+// Apply commits ops exactly as given (no reads, no conditions) as ONE atomic
+// batch. A replica uses it to replay the leader's committed batches.
+func (d *DB) Apply(ops []wal.Op) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	if err := d.waitForRoom(); err != nil {
+		return err
+	}
+	return d.commit(ops)
+}
+
+// LastSeq is the highest fully applied sequence number.
+func (d *DB) LastSeq() uint64 { return d.visible.Load() }
 
 // maybeRotate seals the active memtable if it has outgrown MemtableSize.
 // It runs on the WAL leader, so no other writer is inserting concurrently.

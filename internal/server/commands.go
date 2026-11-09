@@ -101,6 +101,10 @@ func engErr(w *resp.Writer, err error) {
 		w.Error(errNotInt)
 		return
 	}
+	if errors.Is(err, engine.ErrReadOnly) {
+		w.Error(err.Error()) // Redis' own wording and prefix, so client libraries recognise it
+		return
+	}
 	w.Error("ERR " + err.Error())
 }
 

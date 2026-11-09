@@ -61,10 +61,15 @@ type Config struct {
 	TargetFileSize    int64  // leveled compaction output file size
 	CompactionRate    int64  // compaction write throttle in bytes/s (0 = off)
 
-	LogLevel  string // debug | info | warn | error
-	LogFormat string // text | json
-	DevMode   bool   // enables dev-only admin endpoints (crash button)
-	Supervise bool   // run under a supervisor that restarts the server after a crash (implies -dev)
+	LogLevel    string        // debug | info | warn | error
+	LogFormat   string        // text | json
+	DevMode     bool          // enables dev-only admin endpoints (crash button)
+	ReplicaOf   string        // leader's replication address; this node becomes a read-only replica
+	ReplListen  string        // address to serve replication on (leader); empty disables
+	ReplBacklog int64         // bytes of recent batches a leader keeps for catching followers up
+	ReplMinAcks int           // leader: wait for this many replica acks before replying to a write (0 = async)
+	ReplAckWait time.Duration // leader: how long a write waits for those acks before failing
+	Supervise   bool          // run under a supervisor that restarts the server after a crash (implies -dev)
 }
 
 // Default returns the default configuration.
@@ -92,6 +97,9 @@ func Default() Config {
 		LevelSizeRatio:    10,
 		L1MaxBytes:        16 << 20,
 		TargetFileSize:    2 << 20,
+
+		ReplBacklog: 64 << 20,
+		ReplAckWait: 2 * time.Second,
 
 		LogLevel:  "info",
 		LogFormat: "text",
@@ -131,6 +139,11 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "debug | info | warn | error")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "text | json")
 	fs.BoolVar(&c.DevMode, "dev", c.DevMode, "enable dev-only admin endpoints")
+	fs.StringVar(&c.ReplicaOf, "replicaof", c.ReplicaOf, "run as a read-only replica of the leader at this replication address (host:port)")
+	fs.StringVar(&c.ReplListen, "repl-listen", c.ReplListen, "serve replication to followers on this address (leader)")
+	fs.Int64Var(&c.ReplBacklog, "repl-backlog", c.ReplBacklog, "leader: bytes of recent batches kept to catch followers up without a full resync")
+	fs.IntVar(&c.ReplMinAcks, "repl-min-acks", c.ReplMinAcks, "leader: replicas that must acknowledge a write before the client gets OK (0 = asynchronous)")
+	fs.DurationVar(&c.ReplAckWait, "repl-ack-timeout", c.ReplAckWait, "leader: how long a write waits for -repl-min-acks before returning an error")
 	fs.BoolVar(&c.Supervise, "supervise", c.Supervise, "run under a supervisor that restarts the server if it is killed (implies -dev; for the Inspector crash demo)")
 }
 
@@ -169,6 +182,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Fsync == FsyncEvery && c.FsyncInterval <= 0 {
 		return fmt.Errorf("config: -fsync-interval must be > 0 with -fsync=every")
+	}
+	if c.ReplicaOf != "" && c.ReplListen != "" {
+		return fmt.Errorf("config: -replicaof and -repl-listen cannot be combined (chained replication is not supported)")
+	}
+	if c.ReplMinAcks > 0 && c.ReplListen == "" {
+		return fmt.Errorf("config: -repl-min-acks needs -repl-listen")
+	}
+	if c.ReplicaOf != "" && c.InMemory {
+		return fmt.Errorf("config: -replicaof needs a persistent engine (not -in-memory)")
 	}
 	if c.MaxConns < 1 {
 		return fmt.Errorf("config: -max-conns must be >= 1")
