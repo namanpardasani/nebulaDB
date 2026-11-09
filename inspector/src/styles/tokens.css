@@ -1,0 +1,124 @@
+/*
+ * DESIGN TOKENS: every colour, size, radius and duration used by the UI.
+ * components.css only references these variables, never raw values, so a
+ * redesign is a matter of changing this file (and the markup classes in
+ * components.css). Light and dark are both defined; the viewer's OS setting
+ * picks one unless <html data-theme="light|dark"> overrides it.
+ */
+:root {
+  /* surfaces and text */
+  --surface-page: #f6f6f4;
+  --surface-card: #ffffff;
+  --surface-sunken: #efefec;
+  --border: #dcdbd5;
+  --text-1: #141413;
+  --text-2: #52514e;
+  --text-3: #6f6e69;
+
+  /* accent and states */
+  --accent: #2a78d6;
+  --accent-soft: #dbe9fb;
+  --good: #1a7f4b;
+  --good-soft: #d9f0e3;
+  --warn: #9a6700;
+  --warn-soft: #fbeccb;
+  --bad: #c3322f;
+  --bad-soft: #f9dcdb;
+
+  /* LSM levels (L0 .. L6): one hue, light to dark with depth */
+  --level-0: #eb6834;
+  --level-1: #2a78d6;
+  --level-2: #256abf;
+  --level-3: #1c5cab;
+  --level-4: #184f95;
+  --level-5: #104281;
+  --level-6: #0d366b;
+  --memtable: #1baf7a;
+
+  /* typography */
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 14px;
+  --text-lg: 18px;
+  --text-xl: 28px;
+
+  /* spacing, shape */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 6%);
+
+  /* motion: durations are tokens so reduced-motion handling is one place */
+  --dur-fast: 120ms;
+  --dur-medium: 300ms;
+  --dur-slow: 1600ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme='light'])) {
+    --surface-page: #121211;
+    --surface-card: #1a1a19;
+    --surface-sunken: #232321;
+    --border: #3a3935;
+    --text-1: #f0efec;
+    --text-2: #c3c2b7;
+    --text-3: #a3a29a;
+    --accent: #3987e5;
+    --accent-soft: #1d3555;
+    --good: #4cc38a;
+    --good-soft: #17382a;
+    --warn: #e3b341;
+    --warn-soft: #3d3114;
+    --bad: #f0706d;
+    --bad-soft: #432120;
+    --level-0: #d95926;
+    --level-1: #3987e5;
+    --level-2: #5598e7;
+    --level-3: #6da7ec;
+    --level-4: #86b6ef;
+    --level-5: #9ec5f4;
+    --level-6: #b7d3f6;
+    --memtable: #199e70;
+    --shadow-card: none;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --surface-page: #121211;
+  --surface-card: #1a1a19;
+  --surface-sunken: #232321;
+  --border: #3a3935;
+  --text-1: #f0efec;
+  --text-2: #c3c2b7;
+  --text-3: #a3a29a;
+  --accent: #3987e5;
+  --accent-soft: #1d3555;
+  --good: #4cc38a;
+  --good-soft: #17382a;
+  --warn: #e3b341;
+  --warn-soft: #3d3114;
+  --bad: #f0706d;
+  --bad-soft: #432120;
+  --level-0: #d95926;
+  --level-1: #3987e5;
+  --level-2: #5598e7;
+  --level-3: #6da7ec;
+  --level-4: #86b6ef;
+  --level-5: #9ec5f4;
+  --level-6: #b7d3f6;
+  --memtable: #199e70;
+  --shadow-card: none;
+  color-scheme: dark;
+}

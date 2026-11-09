@@ -1,0 +1,110 @@
+/* COMPONENT STYLES. Only var(--token) values; see tokens.css. */
+
+/* ---- layout ---- */
+.app-header {
+  display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap;
+  padding: var(--space-3) var(--space-5);
+  background: var(--surface-card); border-bottom: 1px solid var(--border);
+}
+.app-title { font-size: var(--text-lg); font-weight: 700; }
+.app-nav { display: flex; gap: var(--space-3); margin-left: var(--space-4); }
+.app-nav a { text-decoration: none; color: var(--text-2); padding: var(--space-1) var(--space-2); border-radius: var(--radius-sm); }
+.app-nav a[aria-current='page'] { color: var(--text-1); background: var(--surface-sunken); font-weight: 600; }
+.app-spacer { flex: 1; }
+.page { padding: var(--space-5); max-width: 1400px; margin: 0 auto; display: grid; gap: var(--space-4); }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-4); }
+@media (max-width: 960px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+/* ---- card ---- */
+.card { background: var(--surface-card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); box-shadow: var(--shadow-card); min-width: 0; }
+.card-title { font-size: var(--text-md); font-weight: 600; }
+.card-sub { color: var(--text-3); font-size: var(--text-sm); margin-top: 2px; }
+.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+
+/* ---- stat cards ---- */
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--space-3); }
+.stat { background: var(--surface-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-3) var(--space-4); }
+.stat-label { color: var(--text-3); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+.stat-value { font-size: var(--text-xl); font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.stat-note { color: var(--text-3); font-size: var(--text-xs); }
+
+/* ---- badges and buttons ---- */
+.badge { display: inline-flex; align-items: center; gap: var(--space-1); padding: 2px var(--space-2); border-radius: 999px; font-size: var(--text-xs); font-weight: 600; background: var(--surface-sunken); color: var(--text-2); }
+.badge--good { background: var(--good-soft); color: var(--good); }
+.badge--warn { background: var(--warn-soft); color: var(--warn); }
+.badge--bad { background: var(--bad-soft); color: var(--bad); }
+.badge-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.btn { border: 1px solid var(--border); background: var(--surface-card); border-radius: var(--radius-md); padding: var(--space-2) var(--space-3); cursor: pointer; font-size: var(--text-sm); }
+.btn:hover:not(:disabled) { background: var(--surface-sunken); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn--primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn--primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+.btn--danger { color: var(--bad); border-color: var(--bad); }
+.btn-row { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+
+/* ---- meters ---- */
+.meter { position: relative; height: 12px; border-radius: 999px; background: var(--surface-sunken); overflow: hidden; }
+.meter-fill { position: absolute; inset: 0 auto 0 0; background: var(--memtable); transition: width var(--dur-fast) var(--ease); }
+.meter-fill--warn { background: var(--warn); }
+.meter-fill--bad { background: var(--bad); }
+.meter-marker { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text-2); }
+.meter-label { display: flex; justify-content: space-between; color: var(--text-2); font-size: var(--text-sm); margin-bottom: var(--space-1); font-variant-numeric: tabular-nums; }
+.stack { display: grid; gap: var(--space-3); }
+
+/* ---- key/value lines ---- */
+.kv { display: grid; grid-template-columns: auto 1fr; gap: var(--space-1) var(--space-3); font-size: var(--text-sm); }
+.kv dt { color: var(--text-3); }
+.kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- sparkline ---- */
+.spark { width: 100%; height: 36px; display: block; }
+.spark-line { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.spark-area { fill: var(--accent-soft); stroke: none; }
+
+/* ---- level diagram ---- */
+.levels-svg { width: 100%; height: auto; display: block; }
+.level-label { fill: var(--text-2); font-size: 11px; }
+.level-track { fill: var(--surface-sunken); }
+.file { stroke: var(--surface-card); stroke-width: 1; }
+.file--l0 { fill: var(--level-0); } .file--l1 { fill: var(--level-1); } .file--l2 { fill: var(--level-2); }
+.file--l3 { fill: var(--level-3); } .file--l4 { fill: var(--level-4); } .file--l5 { fill: var(--level-5); } .file--l6 { fill: var(--level-6); }
+.file--fresh { stroke: var(--good); stroke-width: 2.5; }
+.file--merging { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: 4 2; }
+.empty-note { color: var(--text-3); font-size: var(--text-sm); padding: var(--space-4) 0; }
+
+/* ---- feeds and logs ---- */
+.feed { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 280px; overflow: auto; }
+.feed-item { display: grid; grid-template-columns: 70px 1fr auto; gap: var(--space-2); padding: 2px var(--space-2); border-radius: var(--radius-sm); font-size: var(--text-sm); }
+.feed-item--new { background: var(--accent-soft); }
+.feed-seq, .feed-meta { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.feed-key { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 320px; overflow: auto; }
+.log-item { display: grid; grid-template-columns: 64px 140px 1fr; gap: var(--space-2); font-size: var(--text-sm); padding: 2px var(--space-2); border-radius: var(--radius-sm); }
+.log-time { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.log-type { font-weight: 600; }
+.log-type--flush { color: var(--memtable); } .log-type--compaction { color: var(--warn); } .log-type--stall { color: var(--bad); } .log-type--file { color: var(--accent); }
+
+/* ---- banners ---- */
+.banner { padding: var(--space-3) var(--space-4); border-radius: var(--radius-md); font-size: var(--text-sm); border: 1px solid var(--border); }
+.banner--bad { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
+.banner--good { background: var(--good-soft); color: var(--good); border-color: var(--good); }
+.banner--warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+
+/* ---- try it ---- */
+.try-form { display: flex; gap: var(--space-2); }
+.input { flex: 1; min-width: 0; border: 1px solid var(--border); background: var(--surface-card); border-radius: var(--radius-md); padding: var(--space-2) var(--space-3); font-family: var(--font-mono); font-size: var(--text-sm); }
+.try-out { background: var(--surface-sunken); border-radius: var(--radius-md); padding: var(--space-3); max-height: 220px; overflow: auto; display: grid; gap: var(--space-2); }
+.try-cmd { color: var(--accent); }
+.try-reply { white-space: pre-wrap; word-break: break-word; }
+.try-error { color: var(--bad); }
+
+/* ---- prose (about page) ---- */
+.prose { max-width: 820px; display: grid; gap: var(--space-4); }
+.prose h1 { font-size: var(--text-xl); } .prose h2 { font-size: var(--text-lg); margin-top: var(--space-3); }
+.prose pre { background: var(--surface-sunken); border-radius: var(--radius-md); padding: var(--space-3); overflow: auto; }
+.prose table { border-collapse: collapse; width: 100%; font-size: var(--text-sm); }
+.prose th, .prose td { text-align: left; padding: var(--space-2); border-bottom: 1px solid var(--border); vertical-align: top; }
+
+/* ---- motion ---- (kept to one place; reduced motion is handled in the redesign phase) */
+.file { transition: opacity var(--dur-medium) var(--ease); }

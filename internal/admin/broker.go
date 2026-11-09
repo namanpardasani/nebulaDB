@@ -8,6 +8,7 @@ package admin
 import (
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/naman/nebuladb/internal/engine"
 )
@@ -43,7 +44,13 @@ type Subscriber struct {
 
 // NewBroker keeps the last size persisted events for replay.
 func NewBroker(size int) *Broker {
-	return &Broker{cap: size, subs: map[*Subscriber]struct{}{}, nextID: 1}
+	// Event ids must keep increasing ACROSS PROCESS RESTARTS: after a crash the
+	// browser reconnects with the Last-Event-ID of the dead process, and the
+	// replay filter (id > lastID) would otherwise skip every event of the new
+	// one (including its recovery report). Starting from the wall clock in
+	// microseconds keeps ids unique, ordered, and below 2^53 so JavaScript can
+	// represent them exactly.
+	return &Broker{cap: size, subs: map[*Subscriber]struct{}{}, nextID: uint64(time.Now().UnixMicro())}
 }
 
 // Publish records and broadcasts an engine event (persisted for replay).

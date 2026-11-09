@@ -331,3 +331,24 @@ func TestDevEndpoints(t *testing.T) {
 func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
+
+// Event ids must not restart from a small number in a new process, or a browser
+// reconnecting with the old process's Last-Event-ID would miss everything.
+func TestEventIDsOutliveRestarts(t *testing.T) {
+	first := NewBroker(10)
+	for i := 0; i < 1000; i++ {
+		first.Publish(engine.Event{Type: engine.EventFlushEnd})
+	}
+	_, backlog := first.Subscribe(0)
+	lastOld := backlog[len(backlog)-1].ID
+	time.Sleep(2 * time.Millisecond)
+	second := NewBroker(10) // "the restarted server"
+	second.Publish(engine.Event{Type: engine.EventRecovery, Count: 7})
+	_, replay := second.Subscribe(lastOld) // the browser's stale Last-Event-ID
+	if len(replay) != 1 || replay[0].ID <= lastOld {
+		t.Fatalf("restarted server's events must replay for a stale Last-Event-ID: %+v", replay)
+	}
+	if replay[0].ID >= 1<<53 {
+		t.Fatalf("id %d not exactly representable in JavaScript", replay[0].ID)
+	}
+}
