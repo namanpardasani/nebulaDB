@@ -26,6 +26,14 @@ type bar struct {
 	text   string
 }
 
+// displayName makes ablation rows self-explanatory in the charts.
+func displayName(target string) string {
+	if strings.HasSuffix(target, "-bigmem") {
+		return strings.TrimSuffix(target, "-bigmem") + " (64 MiB memtable)"
+	}
+	return target
+}
+
 func family(target string) int {
 	switch {
 	case strings.HasPrefix(target, "nebuladb"):
@@ -194,8 +202,8 @@ func main() {
 				for _, r := range cell {
 					f := family(r.Target)
 					famsSeen[f] = [...]string{"NebulaDB", "Redis 8", "Pebble v2", "BadgerDB v4"}[f]
-					thr = append(thr, bar{r.Target, r.OpsPerSec, f, fmtNum(r.OpsPerSec, "")})
-					lat = append(lat, bar{r.Target, r.P99Us, f, fmtNum(r.P99Us, "us")})
+					thr = append(thr, bar{displayName(r.Target), r.OpsPerSec, f, fmtNum(r.OpsPerSec, "")})
+					lat = append(lat, bar{displayName(r.Target), r.P99Us, f, fmtNum(r.P99Us, "us")})
 					spread := ""
 					if n, _ := r.Extra["runs"].(int); n > 1 {
 						lo, _ := r.Extra["ops_min"].(float64)
