@@ -1,26 +1,26 @@
 import type { InspectorState } from '../lib/reducer'
-import { bytes } from '../lib/format'
-import { Card } from './primitives'
+import { Panel } from './primitives'
 
-/** Sampled recent writes (the server samples about 1 in 16 commits). */
+const ROWS = 10
+
+/** Sampled recent commits (server samples ~1 in 16) plus the writes you made from this page, marked "you". */
 export function WriteFeed({ state }: { state: InspectorState }) {
-  const writes = state.recentWrites
-  const newest = writes[0]?.seq ?? 0
+  const you = state.youWrites.map((w) => ({ k: `y${w.id}`, op: w.op, key: w.key, label: 'you', you: true }))
+  const srv = state.recentWrites.map((w) => ({ k: `s${w.seq}`, op: w.delete ? 'DEL' : 'SET', key: w.key, label: w.seq.toLocaleString('en-US'), you: false }))
+  const rows = [...you, ...srv].slice(0, ROWS)
   return (
-    <Card title="Incoming writes" sub="A sample of recent commits: sequence number, key, value size">
-      {writes.length === 0
-        ? <p className="empty-note">No writes seen yet. Use “Write 500 random keys” or point redis-cli at the server.</p>
+    <Panel id="h-writes" title="incoming writes" num="01">
+      {rows.length === 0
+        ? <div className="empty">No writes yet. Run “write 500 keys”, or point redis-cli at the server.</div>
         : (
-          <ul className="feed" aria-label="recent writes">
-            {writes.map((w) => (
-              <li key={w.seq} className={`feed-item${newest - w.seq < 32 ? ' feed-item--new' : ''}`}>
-                <span className="feed-seq">#{w.seq}</span>
-                <span className="feed-key mono" title={w.key}>{w.delete ? 'DEL ' : 'SET '}{w.key}</span>
-                <span className="feed-meta">{w.delete ? 'tombstone' : bytes(w.value_len)}</span>
+          <ul className="writes" aria-label="Recent commits">
+            {rows.map((r) => (
+              <li key={r.k} className={`enter${r.you ? ' you' : ''}`}>
+                <span className="op">{r.op}</span><span className="key" title={r.key}>{r.key}</span><span>{r.label}</span>
               </li>
             ))}
           </ul>
         )}
-    </Card>
+    </Panel>
   )
 }

@@ -255,7 +255,7 @@ func TestSSEEventsTicksAndReplay(t *testing.T) {
 			lastID = id
 		}
 		if typ == "tick" {
-			for _, k := range []string{"ops_per_sec", "writes_per_sec", "memory", "levels", "cache_hit_rate", "recent_writes"} {
+			for _, k := range []string{"ops_per_sec", "writes_per_sec", "memory", "levels", "cache_hit_rate", "recent_writes", "last_seq", "table_files", "write_amp", "bloom_useful", "uptime_seconds"} {
 				if _, ok := m[k]; !ok {
 					t.Fatalf("tick missing %q: %v", k, m)
 				}
@@ -350,5 +350,23 @@ func TestEventIDsOutliveRestarts(t *testing.T) {
 	}
 	if replay[0].ID >= 1<<53 {
 		t.Fatalf("id %d not exactly representable in JavaScript", replay[0].ID)
+	}
+}
+
+func TestHealthAndWALSegments(t *testing.T) {
+	e := setup(t, false)
+	for i := 0; i < 500; i++ {
+		e.db.Set([]byte(fmt.Sprintf("k%04d", i)), make([]byte, 100), engine.SetOptions{})
+	}
+	_, body := e.do(t, "GET", "/api/levels", "", nil)
+	var lv struct {
+		Memory engine.MemInfo `json:"memory"`
+	}
+	if err := json.Unmarshal(body, &lv); err != nil || len(lv.Memory.WALSegments) == 0 {
+		t.Fatalf("WAL segments missing: %v %s", err, body)
+	}
+	last := lv.Memory.WALSegments[len(lv.Memory.WALSegments)-1]
+	if last.Num != lv.Memory.WALSegment {
+		t.Fatalf("the newest listed segment %d must be the active one %d", last.Num, lv.Memory.WALSegment)
 	}
 }

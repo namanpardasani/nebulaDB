@@ -1,124 +1,125 @@
 /*
- * DESIGN TOKENS: every colour, size, radius and duration used by the UI.
- * components.css only references these variables, never raw values, so a
- * redesign is a matter of changing this file (and the markup classes in
- * components.css). Light and dark are both defined; the viewer's OS setting
- * picks one unless <html data-theme="light|dark"> overrides it.
+ * DESIGN TOKENS: "Strata" (design/nebuladb-design-reference.html).
+ *
+ * An LSM tree is geology: writes are sediment, the memtable is the surface
+ * pool, a flush lays down a fresh layer (L0), compaction presses layers into
+ * denser rock (L1..L3). Colour therefore carries MEANING, not decoration:
+ *
+ *   amber   phosphor: live, primary, in-flight (the memtable pool, merging files)
+ *   magma   danger: crash, stall, kill switch
+ *   ok      new and healthy (freshly created files, recovered)
+ *   l0..l3  the rock itself: sand -> ochre -> rust -> basalt, lighter = newer
+ *
+ * Dark is the default. The viewer's OS preference selects light when set, and
+ * <html data-theme="light|dark"> (the header toggle) overrides both.
+ * Every other stylesheet uses only these variables.
  */
-:root {
-  /* surfaces and text */
-  --surface-page: #f6f6f4;
-  --surface-card: #ffffff;
-  --surface-sunken: #efefec;
-  --border: #dcdbd5;
-  --text-1: #141413;
-  --text-2: #52514e;
-  --text-3: #6f6e69;
 
-  /* accent and states */
-  --accent: #2a78d6;
-  --accent-soft: #dbe9fb;
-  --good: #1a7f4b;
-  --good-soft: #d9f0e3;
-  --warn: #9a6700;
-  --warn-soft: #fbeccb;
-  --bad: #c3322f;
-  --bad-soft: #f9dcdb;
+:root,
+:root[data-theme='dark'] {
+  --bg: #0c0d10;
+  --panel: #131519;
+  --panel-2: #1a1d22;
+  --sunk: #08090b;
+  --line: #262a31;
+  --line-2: #323741;
+  --text: #ece8df;
+  --text-2: #b4afa5;
+  --muted: #8e8a82;
 
-  /* LSM levels (L0 .. L6): one hue, light to dark with depth */
-  --level-0: #eb6834;
-  --level-1: #2a78d6;
-  --level-2: #256abf;
-  --level-3: #1c5cab;
-  --level-4: #184f95;
-  --level-5: #104281;
-  --level-6: #0d366b;
-  --memtable: #1baf7a;
+  --amber: #ffb000;
+  --amber-ink: #ffb000; /* amber used as TEXT (darker on light) */
+  --amber-soft: rgb(255 176 0 / 14%);
+  --magma: #ff4d2e;
+  --magma-soft: rgb(255 77 46 / 14%);
+  --ok: #5fd38d;
 
-  /* typography */
-  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-md: 14px;
-  --text-lg: 18px;
-  --text-xl: 28px;
+  --l0: #e6bc6e;
+  --l1: #c5823f;
+  --l2: #965238;
+  --l3: #5d6878;
+  --water: #121820; /* the empty band a level's files sit in */
 
-  /* spacing, shape */
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 32px;
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --shadow-card: 0 1px 2px rgb(0 0 0 / 6%);
+  --scrim: rgb(8 9 11 / 82%);
+  --on-amber: #1a1200; /* text on amber buttons */
+  --on-magma: #1a0602;
+  --magma-edge: #9e220c; /* the pressed-edge of the kill button */
+  --amber-edge: #9c6c00;
 
-  /* motion: durations are tokens so reduced-motion handling is one place */
-  --dur-fast: 120ms;
-  --dur-medium: 300ms;
-  --dur-slow: 1600ms;
-  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
-
-  color-scheme: light;
+  color-scheme: dark;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme='light'])) {
-    --surface-page: #121211;
-    --surface-card: #1a1a19;
-    --surface-sunken: #232321;
-    --border: #3a3935;
-    --text-1: #f0efec;
-    --text-2: #c3c2b7;
-    --text-3: #a3a29a;
-    --accent: #3987e5;
-    --accent-soft: #1d3555;
-    --good: #4cc38a;
-    --good-soft: #17382a;
-    --warn: #e3b341;
-    --warn-soft: #3d3114;
-    --bad: #f0706d;
-    --bad-soft: #432120;
-    --level-0: #d95926;
-    --level-1: #3987e5;
-    --level-2: #5598e7;
-    --level-3: #6da7ec;
-    --level-4: #86b6ef;
-    --level-5: #9ec5f4;
-    --level-6: #b7d3f6;
-    --memtable: #199e70;
-    --shadow-card: none;
-    color-scheme: dark;
+/* OS prefers light and the viewer has not chosen: light. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --bg: #ece8df;
+    --panel: #faf8f3;
+    --panel-2: #f1ede4;
+    --sunk: #e6e1d6;
+    --line: #d8d1c3;
+    --line-2: #c9c1b1;
+    --text: #17181b;
+    --text-2: #45423b;
+    --muted: #625e56;
+    --amber: #e09a00;
+    --amber-ink: #8a5a00;
+    --amber-soft: rgb(224 154 0 / 16%);
+    --magma: #d3361b;
+    --magma-soft: rgb(211 54 27 / 12%);
+    --ok: #2c8250;
+    --l0: #e2b565;
+    --l1: #be7a3b;
+    --l2: #8f4c33;
+    --l3: #5a6575;
+    --water: #e3e0d7;
+    --scrim: rgb(236 232 223 / 86%);
+    color-scheme: light;
   }
 }
 
-:root[data-theme='dark'] {
-  --surface-page: #121211;
-  --surface-card: #1a1a19;
-  --surface-sunken: #232321;
-  --border: #3a3935;
-  --text-1: #f0efec;
-  --text-2: #c3c2b7;
-  --text-3: #a3a29a;
-  --accent: #3987e5;
-  --accent-soft: #1d3555;
-  --good: #4cc38a;
-  --good-soft: #17382a;
-  --warn: #e3b341;
-  --warn-soft: #3d3114;
-  --bad: #f0706d;
-  --bad-soft: #432120;
-  --level-0: #d95926;
-  --level-1: #3987e5;
-  --level-2: #5598e7;
-  --level-3: #6da7ec;
-  --level-4: #86b6ef;
-  --level-5: #9ec5f4;
-  --level-6: #b7d3f6;
-  --memtable: #199e70;
-  --shadow-card: none;
-  color-scheme: dark;
+:root[data-theme='light'] {
+  --bg: #ece8df;
+  --panel: #faf8f3;
+  --panel-2: #f1ede4;
+  --sunk: #e6e1d6;
+  --line: #d8d1c3;
+  --line-2: #c9c1b1;
+  --text: #17181b;
+  --text-2: #45423b;
+  --muted: #625e56;
+  --amber: #e09a00;
+  --amber-ink: #8a5a00;
+  --amber-soft: rgb(224 154 0 / 16%);
+  --magma: #d3361b;
+  --magma-soft: rgb(211 54 27 / 12%);
+  --ok: #2c8250;
+  --l0: #e2b565;
+  --l1: #be7a3b;
+  --l2: #8f4c33;
+  --l3: #5a6575;
+  --water: #e3e0d7;
+  --scrim: rgb(236 232 223 / 86%);
+  color-scheme: light;
+}
+
+:root {
+  /* type */
+  --font: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+
+  /* shape: files 3, panels 6-10, pills 999 */
+  --r-file: 3px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-panel: 10px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* motion: every animation shows real engine state; durations live here so
+     reduced-motion handling is a single rule (see base.css) */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --paper-ease: cubic-bezier(0.3, 1.35, 0.5, 1); /* springy settle: files dropping into a layer */
+  --t-fast: 0.1s;
+  --t-med: 0.3s;
+  --t-slow: 0.7s;
 }

@@ -10,7 +10,11 @@ import type { StreamMessage } from './types'
  * once per animation frame as a single reducer action, so a burst of events can
  * cause at most one React render per frame no matter how fast they arrive.
  */
-export function useAdmin(): { state: InspectorState; action: (a: DevAction) => Promise<{ ok: boolean; message: string }> } {
+export function useAdmin(): {
+  state: InspectorState
+  action: (a: DevAction) => Promise<{ ok: boolean; message: string }>
+  noteWrite: (op: string, key: string) => void
+} {
   const [state, dispatch] = useReducer(reducer, undefined, initialState)
   const queue = useRef<StreamMessage[]>([])
 
@@ -68,5 +72,6 @@ export function useAdmin(): { state: InspectorState; action: (a: DevAction) => P
   }, [])
 
   const action = useCallback((a: DevAction) => devAction(a), [])
-  return { state, action }
+  const noteWrite = useCallback((op: string, key: string) => dispatch({ t: 'you', op, key }), [])
+  return { state, action, noteWrite }
 }

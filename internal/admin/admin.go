@@ -49,6 +49,9 @@ type Options struct {
 	// address is deliberately bound to a non-loopback interface).
 	AllowAnyHost bool
 	TickEvery    time.Duration // default 250ms
+	// ServerAddr is the RESP listen address, reported by /api/health so the UI
+	// can show what it is looking at.
+	ServerAddr string
 }
 
 // Server is the admin HTTP server.
@@ -174,6 +177,7 @@ func (a *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"status": "ok", "version": server.Version, "dev": a.opts.DevMode,
 		"engine": a.opts.Source != nil, "supervised": a.opts.Supervised,
+		"addr": a.opts.ServerAddr,
 	})
 }
 
@@ -326,6 +330,11 @@ type tickMsg struct {
 	BloomSkipped uint64                `json:"bloom_skipped"`
 	WALFsyncs    uint64                `json:"wal_fsyncs"`
 	WALBytes     uint64                `json:"wal_bytes"`
+	LastSeq      uint64                `json:"last_seq"`
+	TableFiles   int                   `json:"table_files"`
+	WriteAmp     float64               `json:"write_amp"`
+	BloomUseful  float64               `json:"bloom_useful"` // cumulative since start
+	UptimeSecs   float64               `json:"uptime_seconds"`
 	Stalled      bool                  `json:"stalled"`
 	Slowed       bool                  `json:"slowed"`
 	Recent       []engine.WriteSample  `json:"recent_writes"`
@@ -375,15 +384,17 @@ func (a *Server) tickLoop(stop <-chan struct{}) {
 			if dt <= 0 {
 				continue
 			}
-			var opsps float64
+			var opsps, uptime float64
 			if a.opts.Server != nil {
-				opsps = a.opts.Server.Snapshot().OpsPerSec
+				sn := a.opts.Server.Snapshot()
+				opsps, uptime = sn.OpsPerSec, sn.Uptime.Seconds()
 			}
 			msg := tickMsg{
-				Type: "tick", Time: now, OpsPerSec: opsps,
+				Type: "tick", Time: now, OpsPerSec: opsps, UptimeSecs: uptime,
 				WritesPerSec: float64(m.LastSeq-a.prev.LastSeq) / dt,
 				WriteBytesPS: float64(m.UserBytes-a.prev.UserBytes) / dt,
 				Memory:       a.opts.Source.MemoryInfo(),
+				LastSeq:      m.LastSeq, TableFiles: m.TableFiles, WriteAmp: m.WriteAmplification, BloomUseful: m.BloomUsefulRate,
 				Levels:       m.Levels[:],
 				CacheHitRate: m.CacheHitRate,
 				CacheHits:    m.CacheHits - a.prev.CacheHits, CacheMisses: m.CacheMisses - a.prev.CacheMisses,

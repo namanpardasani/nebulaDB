@@ -4,6 +4,7 @@ import (
 	"bytes"
 
 	"github.com/naman/nebuladb/internal/manifest"
+	"github.com/naman/nebuladb/internal/wal"
 )
 
 // LevelMetrics summarises one level.
@@ -72,6 +73,7 @@ type EngineMetrics struct {
 	WALSegment      uint64  `json:"wal_segment"`
 	WALFailed       string  `json:"wal_failed"`
 
+	RecoverySegments       int    `json:"recovery_segments"`
 	RecoveryBatches        int    `json:"recovery_batches"`
 	RecoveryTornTail       bool   `json:"recovery_torn_tail"`
 	RecoveryTruncatedBytes int64  `json:"recovery_truncated_bytes"`
@@ -112,7 +114,7 @@ func (d *DB) Metrics() EngineMetrics {
 		WALFsyncSeconds: float64(ws.SyncNanos) / 1e9, WALMaxGroup: ws.MaxGroup,
 		WALActiveBytes: d.wal.Size(), WALSegment: d.wal.ActiveSegment(),
 
-		RecoveryBatches: d.recovery.Batches, RecoveryTornTail: d.recovery.TornTail,
+		RecoverySegments: len(d.recovery.Segments), RecoveryBatches: d.recovery.Batches, RecoveryTornTail: d.recovery.TornTail,
 		RecoveryTruncatedBytes: d.recovery.TruncatedBytes, ManifestNumber: d.mf.Number(),
 	}
 	if m.BloomChecked > 0 {
@@ -147,18 +149,27 @@ type FileInfo struct {
 	Largest  string `json:"largest"`
 }
 
+// WALSeg is one write-ahead-log segment file on disk.
+type WALSeg struct {
+	Num   uint64 `json:"num"`
+	Bytes int64  `json:"bytes"`
+}
+
 // MemInfo describes the write buffers.
 type MemInfo struct {
-	ActiveBytes     int64   `json:"active_bytes"`
-	ActiveEntries   int64   `json:"active_entries"`
-	Threshold       int64   `json:"threshold"`
-	ImmutableBytes  []int64 `json:"immutable_bytes"` // newest first
-	WALActiveBytes  int64   `json:"wal_active_bytes"`
-	WALSegment      uint64  `json:"wal_segment"`
-	L0SlowdownAt    int     `json:"l0_slowdown_at"`
-	L0StopAt        int     `json:"l0_stop_at"`
-	MaxImmutables   int     `json:"max_immutables"`
-	CompactionStyle string  `json:"compaction_style"`
+	ActiveBytes    int64   `json:"active_bytes"`
+	ActiveEntries  int64   `json:"active_entries"`
+	Threshold      int64   `json:"threshold"`
+	ImmutableBytes []int64 `json:"immutable_bytes"` // newest first
+	WALActiveBytes int64   `json:"wal_active_bytes"`
+	WALSegment     uint64  `json:"wal_segment"`
+	// WALSegments lists every segment file currently on disk, oldest first. A
+	// segment disappears once the memtable it fed has been flushed.
+	WALSegments     []WALSeg `json:"wal_segments"`
+	L0SlowdownAt    int      `json:"l0_slowdown_at"`
+	L0StopAt        int      `json:"l0_stop_at"`
+	MaxImmutables   int      `json:"max_immutables"`
+	CompactionStyle string   `json:"compaction_style"`
 }
 
 // printable renders a key for display: printable ASCII as is, anything else
@@ -213,6 +224,16 @@ func (d *DB) MemoryInfo() MemInfo {
 	}
 	for _, im := range imms {
 		mi.ImmutableBytes = append(mi.ImmutableBytes, im.mt.ApproxSize())
+	}
+	mi.WALSegments = []WALSeg{}
+	if nums, err := wal.ListSegments(d.opts.FS, d.opts.Dir); err == nil {
+		for _, n := range nums {
+			var size int64
+			if fi, err := d.opts.FS.Stat(wal.SegmentPath(d.opts.Dir, n)); err == nil {
+				size = fi.Size()
+			}
+			mi.WALSegments = append(mi.WALSegments, WALSeg{Num: n, Bytes: size})
+		}
 	}
 	return mi
 }

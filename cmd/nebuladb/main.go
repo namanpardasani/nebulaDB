@@ -87,7 +87,7 @@ func run() error {
 
 	var adm *admin.Server
 	if cfg.AdminAddr != "" {
-		aopts := admin.Options{Server: srv, Broker: broker, DevMode: cfg.DevMode || supervised, Supervised: supervised}
+		aopts := admin.Options{Server: srv, Broker: broker, ServerAddr: ln.Addr().String(), DevMode: cfg.DevMode || supervised, Supervised: supervised}
 		if db, ok := eng.(*engine.DB); ok {
 			aopts.Source, aopts.Dev = db, db
 		}

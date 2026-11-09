@@ -36,17 +36,28 @@ export interface InspectorState {
   stalledUntil: number
   totals: { bloomChecked: number; bloomSkipped: number; cacheHits: number; cacheMisses: number; writes: number }
   nextLogId: number
+  /** seismograph samples, newest last: signed amplitude in [-1, 1] */
+  activity: number[]
+  spike: number
+  /** commands the user ran from this page that wrote (shown as "you" rows) */
+  youWrites: YouWrite[]
+  crashes: number
 }
+
+export interface YouWrite { id: number; op: string; key: string }
 
 export const HISTORY_LEN = 120
 export const LOG_LEN = 150
 export const WRITES_LEN = 24
 export const FRESH_MS = 3000
+export const ACTIVITY_LEN = 160
+export const YOU_LEN = 4
 
 export function initialState(): InspectorState {
   return {
     conn: 'connecting', history: [], recentWrites: [], log: [], fresh: {}, merging: [],
     flushing: false, compacting: false, stalledUntil: 0, nextLogId: 1,
+    activity: new Array<number>(ACTIVITY_LEN).fill(0), spike: 0, youWrites: [], crashes: 0,
     totals: { bloomChecked: 0, bloomSkipped: 0, cacheHits: 0, cacheMisses: 0, writes: 0 },
   }
 }
@@ -57,6 +68,7 @@ export type Action =
   | { t: 'stats'; stats: StatsResponse }
   | { t: 'levels'; levels: LevelsResponse }
   | { t: 'batch'; messages: StreamMessage[]; now: number }
+  | { t: 'you'; op: string; key: string }
   | { t: 'expire'; now: number }
 
 function applyTick(s: InspectorState, m: Tick, now: number): InspectorState {
@@ -76,8 +88,17 @@ function applyTick(s: InspectorState, m: Tick, now: number): InspectorState {
     const fresh = m.recent_writes.filter((w) => !seen.has(w.seq)).sort((a, b) => b.seq - a.seq)
     recent = [...fresh, ...recent].slice(0, WRITES_LEN)
   }
+  // Seismograph: amplitude grows with the real write rate (relative to the
+  // recent peak) and spikes on flushes/compactions/stalls; alternating sign
+  // gives the trace its shape without inventing any magnitude.
+  const peak = Math.max(1, ...s.history.map((h) => h.writesPerSec), m.writes_per_sec)
+  const amp = Math.min(1, (m.writes_per_sec / peak) * 0.35 + s.spike)
+  const sign = s.activity.length % 2 === 0 ? 1 : -1
+  const activity = [...s.activity.slice(1), sign * amp]
   return {
     ...s,
+    activity,
+    spike: s.spike * 0.82 < 0.02 ? 0 : s.spike * 0.82,
     tick: m,
     history,
     recentWrites: recent,
@@ -100,26 +121,38 @@ function applyEvent(s: InspectorState, e: EngineEvent, now: number): InspectorSt
   }
   switch (e.type) {
     case 'flush_start': next.flushing = true; break
-    case 'flush_end': next.flushing = false; break
+    case 'flush_end': next.flushing = false; next.spike = Math.max(s.spike, 0.75); break
     case 'compaction_start': next.compacting = true; next.merging = e.inputs ?? []; break
-    case 'compaction_end': next.compacting = false; next.merging = []; break
+    case 'compaction_end': next.compacting = false; next.merging = []; next.spike = Math.max(s.spike, 0.95); break
     case 'file_created':
       if (e.file) next.fresh = { ...s.fresh, [e.file]: now + FRESH_MS }
       break
-    case 'write_stall': next.stalledUntil = now + 2000; break
+    case 'write_stall': next.stalledUntil = now + 2000; next.spike = 1; break
     default: break
   }
   return next
+}
+
+function withLog(s: InspectorState, e: EngineEvent, now: number): InspectorState {
+  return { ...s, log: [{ id: s.nextLogId, at: now, event: e }, ...s.log].slice(0, LOG_LEN), nextLogId: s.nextLogId + 1 }
 }
 
 export function reducer(s: InspectorState, a: Action): InspectorState {
   switch (a.t) {
     case 'conn': {
       if (a.state === s.conn) return s
-      if (a.state === 'down') return { ...s, conn: 'down', downSince: s.downSince ?? a.now }
+      if (a.state === 'down') {
+        const first = s.downSince === undefined
+        // Flatline: a jolt (the signal dropping) at the right edge, nothing before it.
+        const jolt = [1, -1, 1, -1, 1, -1]
+        const activity = [...new Array<number>(ACTIVITY_LEN - jolt.length).fill(0), ...jolt]
+        const base = { ...s, conn: 'down' as const, downSince: s.downSince ?? a.now, activity, spike: 0 }
+        return first ? withLog(base, { type: 'connection_lost', time: new Date(a.now).toISOString() }, a.now) : base
+      }
       // coming back from an outage
       if (s.conn === 'down' && s.downSince !== undefined) {
-        return { ...s, conn: a.state, downSince: undefined, recoveredAfterMs: a.now - s.downSince, recoveredAt: a.now }
+        const back = { ...s, conn: a.state, downSince: undefined, recoveredAfterMs: a.now - s.downSince, recoveredAt: a.now, crashes: s.crashes + 1, spike: 0.9 }
+        return withLog(back, { type: 'connection_restored', time: new Date(a.now).toISOString() }, a.now)
       }
       return { ...s, conn: a.state, downSince: undefined }
     }
@@ -131,7 +164,10 @@ export function reducer(s: InspectorState, a: Action): InspectorState {
       for (const m of a.messages) cur = m.type === 'tick' ? applyTick(cur, m as Tick, a.now) : applyEvent(cur, m as EngineEvent, a.now)
       return cur
     }
+    case 'you':
+      return { ...s, youWrites: [{ id: s.nextLogId, op: a.op, key: a.key }, ...s.youWrites].slice(0, YOU_LEN), nextLogId: s.nextLogId + 1 }
     case 'expire': {
+      if (s.stalledUntil && s.stalledUntil <= a.now) s = { ...s, stalledUntil: 0 }
       const keys = Object.keys(s.fresh)
       if (!keys.length) return s
       const fresh: Record<number, number> = {}

@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NebulaDB design reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ==================================================================
+   NEBULADB DESIGN REFERENCE
+   Concept: STRATA. An LSM tree is geology. Writes fall like sediment,
+   the memtable is the surface pool, a flush lays down a fresh layer
+   (L0), compaction presses layers down into denser rock (L1..L3).
+   The Inspector is a field instrument reading that core sample, with
+   a seismograph for activity and a guarded kill switch for crashes.
+   Same hand as Zerodrift (thin lines, mono labels, one hardware
+   control), different material: rock, sediment, phosphor amber.
+   ================================================================== */
+:root, [data-theme="dark"]{
+  --bg:#0C0D10; --panel:#131519; --panel-2:#1A1D22; --sunk:#08090B; --line:#262A31; --line-2:#323741;
+  --text:#ECE8DF; --text-2:#B4AFA5; --muted:#8E8A82;
+  --amber:#FFB000; --amber-ink:#FFB000; --amber-soft:rgba(255,176,0,.14);
+  --magma:#FF4D2E; --magma-soft:rgba(255,77,46,.14); --ok:#5FD38D;
+  --l0:#E6BC6E; --l1:#C5823F; --l2:#965238; --l3:#5D6878;
+  --water:#121820;
+  --font:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --ease:cubic-bezier(.2,.8,.2,1);
+  --paper-ease:cubic-bezier(.3,1.35,.5,1);
+}
+[data-theme="light"]{
+  --bg:#ECE8DF; --panel:#FAF8F3; --panel-2:#F1EDE4; --sunk:#E6E1D6; --line:#D8D1C3; --line-2:#C9C1B1;
+  --text:#17181B; --text-2:#45423B; --muted:#625E56;
+  --amber:#E09A00; --amber-ink:#8A5A00; --amber-soft:rgba(224,154,0,.16);
+  --magma:#D3361B; --magma-soft:rgba(211,54,27,.12); --ok:#2C8250;
+  --l0:#E2B565; --l1:#BE7A3B; --l2:#8F4C33; --l3:#5A6575;
+  --water:#E3E0D7;
+}
+*{box-sizing:border-box}
+body{margin:0;background:#DAD6CD;color:#17181B;font-family:var(--font);font-size:14px;line-height:1.45}
+button{font:inherit;cursor:pointer;color:inherit}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* doc chrome */
+.doc{max-width:1440px;margin:0 auto;padding:36px 20px 24px;display:flex;flex-wrap:wrap;gap:24px;justify-content:space-between;align-items:flex-end}
+.doc h1{margin:0;font-weight:300;font-size:38px;letter-spacing:-.03em;line-height:1}
+.doc p{margin:10px 0 0;max-width:620px;color:#45423B}
+.sws{display:flex;flex-wrap:wrap;gap:8px}
+.sw{width:84px;font-family:var(--mono);font-size:10.5px;color:#45423B}
+.sw i{display:block;height:34px;border-radius:6px;margin-bottom:5px;border:1px solid rgba(0,0,0,.1)}
+.plate{max-width:1440px;margin:0 auto 56px;padding:0 20px}
+.plate-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#4A4740}
+.note{margin:10px 2px 0;font-size:13px;color:#4F4C45;max-width:980px}
+.frame{border-radius:14px;overflow:hidden;border:1px solid #C3BDB0;box-shadow:0 30px 60px -40px rgba(0,0,0,.5)}
+
+/* ================= INSPECTOR ================= */
+.insp{background:var(--bg);color:var(--text);position:relative}
+.top{display:flex;flex-wrap:wrap;align-items:center;gap:18px;padding:14px 18px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-weight:600;font-size:17px;letter-spacing:-.01em}
+.brand small{font-weight:400;color:var(--muted);font-size:12px;letter-spacing:.08em}
+.conn{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;color:var(--text-2);padding:5px 10px;border:1px solid var(--line);border-radius:999px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:0 0 8px}
+.conn.down .dot{background:var(--magma);animation:blink .5s steps(1,end) infinite}
+.conn.rec .dot{background:var(--amber);animation:blink .8s steps(1,end) infinite}
+@keyframes blink{50%{opacity:.25}}
+.top .sp{flex:1}
+.tabs{display:flex;gap:4px;padding:3px;border:1px solid var(--line);border-radius:9px}
+.tabs a{padding:6px 12px;border-radius:7px;text-decoration:none;color:var(--text-2);font-size:13px}
+.tabs a.on{background:var(--panel-2);color:var(--text)}
+.ghost{border:1px solid var(--line);background:transparent;border-radius:8px;padding:6px 10px;font-family:var(--mono);font-size:12px;color:var(--text-2)}
+
+.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:1px;background:var(--line);border-bottom:1px solid var(--line)}
+.stat{background:var(--bg);padding:14px 18px;min-width:0}
+.stat .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.stat .v{font-family:var(--mono);font-size:24px;font-weight:500;margin-top:6px;letter-spacing:-.01em;white-space:nowrap}
+.stat .v small{font-size:13px;color:var(--muted);font-weight:400}
+.stat svg{display:block;margin-top:6px;width:100%;height:22px}
+
+.grid{display:grid;grid-template-columns:290px minmax(0,1fr) 330px;gap:12px;padding:12px}
+.col{display:flex;flex-direction:column;gap:12px;min-width:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;min-width:0;position:relative}
+.ph{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.ph b{color:var(--text-2);font-weight:500}
+.ph .id{color:var(--muted);opacity:.8}
+.pb{padding:12px}
+
+/* incoming writes */
+.writes{list-style:none;margin:0;padding:6px 0;height:206px;overflow:hidden;font-family:var(--mono);font-size:12px}
+.writes li{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:8px;padding:4px 12px;color:var(--text-2);animation:slidein .35s var(--ease)}
+.writes li .op{color:var(--muted)}
+.writes li .key{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.writes li.you{background:var(--amber-soft)}
+.writes li.you .op{color:var(--amber-ink)}
+@keyframes slidein{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+
+/* memtable + wal */
+.mem{display:grid;grid-template-columns:74px minmax(0,1fr);gap:14px;align-items:end}
+.tank{position:relative;height:150px;border:1px solid var(--line-2);border-radius:8px;background:var(--sunk);overflow:hidden}
+.tank .fill{position:absolute;left:0;right:0;bottom:0;height:0;background:linear-gradient(180deg,rgba(255,176,0,.55),rgba(255,176,0,.22));transition:height .25s linear}
+.tank .fill::before{content:"";position:absolute;left:-50%;right:-50%;top:-6px;height:12px;background:radial-gradient(ellipse at 50% 100%,rgba(255,176,0,.7) 0 40%,transparent 41%) 0 0/24px 12px repeat-x;animation:wave 1.6s linear infinite}
+@keyframes wave{to{transform:translateX(24px)}}
+.tank .marks{position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent 0 29px,var(--line) 29px 30px);pointer-events:none;opacity:.7}
+.tank.seal{animation:seal .5s var(--paper-ease)}
+@keyframes seal{30%{transform:scale(.94)}}
+.memv{font-family:var(--mono)}
+.memv .big{font-size:22px;font-weight:500}
+.memv .sub{color:var(--muted);font-size:12px}
+.sealed{display:flex;flex-direction:column;gap:6px;margin-top:12px;min-height:30px}
+.cap{display:flex;justify-content:space-between;gap:6px;font-family:var(--mono);font-size:11.5px;padding:5px 8px;border-radius:6px;border:1px dashed var(--amber);color:var(--amber-ink);animation:slidein .3s var(--ease)}
+.wal{margin-top:14px}
+.wal .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.segs{display:flex;flex-direction:column;gap:4px}
+.seg{display:grid;grid-template-columns:minmax(0,1fr) 56px;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--text-2);transition:opacity .4s}
+.seg .bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+.seg .bar i{display:block;height:100%;background:var(--text-2);transition:width .25s linear}
+.seg.cur .bar i{background:var(--amber)}
+.seg.gone{opacity:0}
+
+/* strata */
+.strata-wrap{padding:12px 14px 10px}
+.strata{position:relative;height:350px}
+.band{position:absolute;left:68px;right:0;border-radius:6px;background:var(--water);border:1px solid var(--line)}
+.band::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent 0 9px,rgba(127,127,127,.06) 9px 10px);border-radius:6px;pointer-events:none}
+.blabel{position:absolute;left:0;width:60px;font-family:var(--mono);font-size:11px;color:var(--text-2);line-height:1.3}
+.blabel small{display:block;color:var(--muted);font-size:10px}
+.file{position:absolute;border-radius:3px;overflow:hidden;
+  transition:left .7s var(--ease),width .7s var(--ease),top .7s var(--paper-ease),height .5s var(--ease),opacity .45s,transform .45s;
+  background-image:repeating-linear-gradient(135deg,rgba(0,0,0,.13) 0 2px,transparent 2px 7px);box-shadow:inset 0 1px 0 rgba(255,255,255,.25),0 2px 0 rgba(0,0,0,.25)}
+.file span{position:absolute;left:6px;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:10px;color:rgba(20,16,10,.82);white-space:nowrap;font-weight:500}
+.file.L0{background-color:var(--l0)} .file.L1{background-color:var(--l1)} .file.L2{background-color:var(--l2)} .file.L3{background-color:var(--l3)}
+.file.L2 span,.file.L3 span{color:rgba(255,255,255,.85)}
+.file.fresh{outline:2px solid var(--ok);outline-offset:1px}
+.file.merging{outline:2px dashed var(--amber);outline-offset:1px;animation:press .9s ease-in-out infinite}
+@keyframes press{50%{transform:scaleY(.82)}}
+.file.gone{opacity:0;transform:scaleY(.2)}
+.axis{position:absolute;left:68px;right:0;bottom:0;height:16px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted)}
+.strata-foot{display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between;padding:8px 14px 12px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--muted)}
+.legend{display:flex;flex-wrap:wrap;gap:14px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:-2px;margin-right:6px}
+.flushing{position:absolute;left:68px;top:-26px;font-family:var(--mono);font-size:11px;color:var(--amber-ink);opacity:0;transition:opacity .3s}
+.flushing.on{opacity:1}
+
+/* backpressure */
+.ruler{position:relative;height:46px;margin:6px 4px 4px}
+.ruler .track{position:absolute;left:0;right:0;top:20px;height:8px;border-radius:4px;background:linear-gradient(90deg,var(--line) 0 50%,var(--amber-soft) 50% 83.3%,var(--magma-soft) 83.3%)}
+.ruler .tick{position:absolute;top:14px;width:1px;height:20px;background:var(--line-2)}
+.ruler .tl{position:absolute;top:36px;transform:translateX(-50%);font-family:var(--mono);font-size:10px;color:var(--muted);white-space:nowrap}
+.ruler .needle{position:absolute;top:8px;width:3px;height:32px;margin-left:-1.5px;border-radius:2px;background:var(--text);transition:left .5s var(--paper-ease),background .3s}
+.bp-state{display:flex;justify-content:space-between;align-items:baseline;font-family:var(--mono);font-size:12px;margin-top:6px}
+.bp-state b{font-size:15px;font-weight:500}
+.bp-state.slow b{color:var(--amber-ink)} .bp-state.stall b{color:var(--magma)}
+
+/* seismograph + log */
+.seis{display:block;width:100%;height:96px;background:var(--sunk);border-bottom:1px solid var(--line)}
+.log{list-style:none;margin:0;padding:6px 0;height:228px;overflow:hidden;font-family:var(--mono);font-size:11.5px}
+.log li{display:grid;grid-template-columns:60px 16px minmax(0,1fr);gap:6px;padding:3px 12px;color:var(--text-2);animation:slidein .3s var(--ease)}
+.log li .t{color:var(--muted)}
+.log li .g{text-align:center;color:var(--muted)}
+.log li.flush .g{color:var(--l0)} .log li.compact .g{color:var(--l1)} .log li.stall .g,.log li.crash .g{color:var(--magma)} .log li.recover .g{color:var(--ok)}
+.log li.crash{color:var(--magma)} .log li.recover{color:var(--ok)}
+
+/* bottom row */
+.row2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr) minmax(0,1.1fr);gap:12px;padding:0 12px 12px}
+.meter2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line)}
+.m2{background:var(--panel);padding:12px}
+.m2 .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.m2 .v{font-family:var(--mono);font-size:26px;font-weight:500;color:var(--amber-ink);margin-top:4px}
+.m2 .c{font-size:12px;color:var(--muted)}
+.m2 svg{display:block;width:100%;height:30px;margin-top:6px}
+.m2:first-child{border-radius:0 0 0 10px}.m2:last-child{border-radius:0 0 10px 0}
+.term{background:var(--sunk);border-radius:0 0 10px 10px;font-family:var(--mono);font-size:12.5px}
+.term .out{height:150px;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:2px}
+.term .out .in{color:var(--text)} .term .out .in::before{content:"nebula> ";color:var(--amber-ink)}
+.term .out .res{color:var(--text-2)} .term .out .err{color:var(--magma)}
+.term form{display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);padding:8px 12px}
+.term form span{color:var(--amber-ink)}
+.term input{flex:1;min-width:0;background:transparent;border:0;outline:0;color:var(--text);font:inherit;padding:6px 0}
+.term form:focus-within{box-shadow:inset 0 0 0 1px var(--amber);border-radius:0 0 10px 10px}
+.ctrls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.hw{border:1px solid var(--line-2);background:var(--panel-2);border-radius:8px;padding:12px 10px;text-align:left;font-family:var(--mono);font-size:12px;box-shadow:0 3px 0 var(--line-2);transition:transform .1s,box-shadow .1s;min-height:52px}
+.hw small{display:block;color:var(--muted);font-size:10.5px;margin-top:2px}
+.hw:hover{border-color:var(--text-2)}
+.hw:active{transform:translateY(2px);box-shadow:0 1px 0 var(--line-2)}
+.kill{grid-column:1/-1;position:relative;height:78px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);perspective:500px;overflow:visible}
+.kill .fire{position:absolute;inset:10px;border:0;border-radius:7px;background:var(--magma);color:#1A0602;font-family:var(--mono);font-weight:600;font-size:14px;letter-spacing:.06em;box-shadow:0 4px 0 #9E220C;transition:transform .1s,box-shadow .1s}
+.kill .fire small{display:block;font-weight:400;font-size:10.5px;letter-spacing:0;opacity:.85}
+.kill .fire:active{transform:translateY(3px);box-shadow:0 1px 0 #9E220C}
+.kill .cover{position:absolute;inset:4px;border-radius:8px;border:1px solid rgba(255,255,255,.18);background:linear-gradient(180deg,rgba(255,77,46,.32),rgba(255,77,46,.16));
+  backdrop-filter:blur(1px);transform-origin:top;transition:transform .45s var(--paper-ease);font-family:var(--mono);font-size:11.5px;color:var(--text);display:flex;align-items:center;justify-content:center;gap:8px;z-index:2}
+.kill .cover::before{content:"";position:absolute;inset:6px;border-radius:6px;background:repeating-linear-gradient(135deg,rgba(0,0,0,.18) 0 6px,transparent 6px 12px);pointer-events:none}
+.kill.armed .cover{transform:rotateX(-112deg)}
+.kill.armed .fire{animation:armed 1s ease-in-out infinite}
+@keyframes armed{50%{box-shadow:0 4px 0 #9E220C,0 0 0 6px rgba(255,77,46,.18)}}
+
+/* crash overlay */
+.down-overlay{position:absolute;inset:0;z-index:20;display:none;align-items:center;justify-content:center;background:rgba(8,9,11,.82);overflow:hidden}
+[data-theme="light"] .down-overlay{background:rgba(236,232,223,.86)}
+.down-overlay.on{display:flex}
+.down-overlay::before{content:"";position:absolute;inset:-50%;background:repeating-linear-gradient(0deg,rgba(255,255,255,.04) 0 1px,transparent 1px 3px);animation:scan 6s linear infinite;pointer-events:none}
+@keyframes scan{to{transform:translateY(60px)}}
+.down-box{position:relative;width:min(560px,90%);border:1px solid var(--line-2);border-radius:12px;background:var(--panel);padding:22px 24px;font-family:var(--mono);font-size:13px}
+.down-box h3{margin:0 0 4px;font-size:22px;font-weight:500;color:var(--magma);letter-spacing:-.01em}
+.down-box h3.ok{color:var(--ok)}
+.down-box .sub{color:var(--muted);margin-bottom:14px}
+.down-box ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.down-box li{display:flex;justify-content:space-between;gap:12px;color:var(--text-2);animation:slidein .3s var(--ease)}
+.down-box li b{font-weight:500;color:var(--text)}
+.insp.dim .grid,.insp.dim .row2,.insp.dim .stats{filter:saturate(.2) brightness(.7)}
+
+/* ================= ABOUT PAGE ================= */
+.about{background:var(--bg);color:var(--text)}
+.ab-hero{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);gap:40px;align-items:center;padding:56px 56px 40px}
+.ab-kicker{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.ab-hero h2{margin:14px 0 0;font-weight:300;font-size:clamp(44px,6vw,84px);line-height:.95;letter-spacing:-.045em}
+.ab-hero h2 em{font-style:normal;color:var(--amber-ink)}
+.ab-hero p{margin:20px 0 0;max-width:520px;color:var(--text-2);font-size:16px;line-height:1.6}
+.ab-cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px}
+.btn-amber{border:0;border-radius:8px;background:var(--amber);color:#1A1200;font-weight:600;padding:13px 18px;box-shadow:0 4px 0 #9C6C00;transition:transform .1s,box-shadow .1s}
+.btn-amber:active{transform:translateY(3px);box-shadow:0 1px 0 #9C6C00}
+.btn-line{border:1px solid var(--text-2);background:transparent;border-radius:8px;padding:12px 18px}
+.core{display:block;width:100%;max-width:440px;height:auto;margin:0 auto}
+.drip{animation:drip 2.4s cubic-bezier(.5,0,.9,.6) infinite}
+.drip.d2{animation-delay:.8s}.drip.d3{animation-delay:1.6s}
+@keyframes drip{0%{transform:translateY(-30px);opacity:0}15%{opacity:1}80%{opacity:1}100%{transform:translateY(58px);opacity:0}}
+.proof{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.proof div{padding:22px 24px;border-right:1px solid var(--line)}
+.proof div:last-child{border-right:0}
+.proof b{display:block;font-family:var(--mono);font-size:34px;font-weight:500;letter-spacing:-.02em}
+.proof span{color:var(--muted);font-size:13px}
+.ab-sec{padding:44px 56px;display:grid;grid-template-columns:260px minmax(0,1fr);gap:40px;border-bottom:1px solid var(--line)}
+.ab-sec h3{margin:0;font-weight:400;font-size:24px;letter-spacing:-.02em}
+.ab-sec .lead{margin:8px 0 0;color:var(--muted);font-size:13px}
+.steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}
+.step{border:1px solid var(--line);border-radius:10px;padding:14px;background:var(--panel)}
+.step i{display:block;height:6px;border-radius:3px;margin-bottom:12px}
+.step b{font-family:var(--mono);font-weight:500;font-size:12px;color:var(--muted)}
+.step p{margin:6px 0 0;font-size:13px;color:var(--text-2)}
+.wl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.wl div{border:1px solid var(--line);border-radius:10px;padding:16px 18px;background:var(--panel)}
+.wl h4{margin:0 0 8px;font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;font-weight:500}
+.wl .win h4{color:var(--ok)} .wl .lose h4{color:var(--magma)}
+.wl ul{margin:0;padding-left:18px;color:var(--text-2)}
+.wl li{margin:4px 0}
+.code{background:var(--sunk);border:1px solid var(--line);border-radius:10px;padding:16px 18px;font-family:var(--mono);font-size:13px;line-height:1.75;color:var(--text-2);overflow-x:auto;white-space:pre}
+.code .p{color:var(--amber-ink)} .code .c{color:var(--muted)}
+
+/* responsive */
+@media (max-width:1200px){
+  .grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .grid .center{grid-column:1/-1;order:-1}
+  .row2{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .row2 .termp{grid-column:1/-1}
+  .stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .ab-hero{grid-template-columns:minmax(0,1fr)}
+  .steps{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:720px){
+  .plate{padding:0 10px}
+  .grid,.row2{grid-template-columns:minmax(0,1fr)}
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .strata{height:330px}
+  .blabel{width:44px;font-size:10px}.band,.axis,.flushing{left:48px}
+  .ab-hero,.ab-sec{padding:32px 18px}
+  .ab-sec{grid-template-columns:minmax(0,1fr);gap:16px}
+  .proof{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .proof div:nth-child(2){border-right:0}
+  .steps,.wl{grid-template-columns:minmax(0,1fr)}
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<header class="doc">
+  <div>
+    <h1>nebuladb / design reference</h1>
+    <p><b>Strata.</b> An LSM tree is geology: writes fall like sediment, the memtable is the surface pool, a flush lays down a fresh layer, compaction presses layers into denser rock. The Inspector is a field instrument reading that core sample. Everything below runs a live simulation; the crash button works. Toggle light/dark in the Inspector header.</p>
+  </div>
+  <div class="sws" aria-label="Color tokens">
+    <div class="sw"><i style="background:#0C0D10"></i>bg<br>#0C0D10</div>
+    <div class="sw"><i style="background:#131519"></i>panel<br>#131519</div>
+    <div class="sw"><i style="background:#ECE8DF"></i>text / light bg<br>#ECE8DF</div>
+    <div class="sw"><i style="background:#FFB000"></i>phosphor<br>#FFB000</div>
+    <div class="sw"><i style="background:#FF4D2E"></i>magma<br>#FF4D2E</div>
+    <div class="sw"><i style="background:#5FD38D"></i>ok<br>#5FD38D</div>
+    <div class="sw"><i style="background:#E6BC6E"></i>L0 sand<br>#E6BC6E</div>
+    <div class="sw"><i style="background:#C5823F"></i>L1 ochre<br>#C5823F</div>
+    <div class="sw"><i style="background:#965238"></i>L2 rust<br>#965238</div>
+    <div class="sw"><i style="background:#5D6878"></i>L3 basalt<br>#5D6878</div>
+  </div>
+</header>
+
+<!-- ======================= PLATE 01 · INSPECTOR ======================= -->
+<section class="plate">
+  <div class="plate-bar"><span>plate 01 · inspector (live simulation)</span><span>sample data</span></div>
+  <div class="frame">
+  <div class="insp" id="insp">
+    <div class="top">
+      <div class="brand">
+        <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><rect x="3" y="3" width="20" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3 9h20" stroke="#E6BC6E" stroke-width="2.4"/><path d="M3 13.5h20" stroke="#C5823F" stroke-width="2.4"/><path d="M3 18h20" stroke="#965238" stroke-width="2.4"/></svg>
+        nebuladb <small>inspector</small>
+      </div>
+      <div class="conn" id="conn" role="status" aria-live="polite"><span class="dot"></span><span id="connT">connected · 127.0.0.1:6380</span></div>
+      <span class="mono" style="font-size:12px;color:var(--muted)">uptime <span id="uptime">00:00:00</span> · crashes survived <span id="crashN">0</span></span>
+      <span class="sp"></span>
+      <nav class="tabs" aria-label="Pages"><a class="on" href="#insp">Inspector</a><a href="#about">About</a></nav>
+      <button class="ghost" id="themeBtn" aria-label="Toggle light or dark theme">light / dark</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">writes / s</div><div class="v" id="sW">0</div><svg viewBox="0 0 120 22" preserveAspectRatio="none" aria-hidden="true"><polyline id="spW" fill="none" stroke="var(--amber)" stroke-width="1.5"/></svg></div>
+      <div class="stat"><div class="k">commands / s</div><div class="v" id="sC">0</div><svg viewBox="0 0 120 22" preserveAspectRatio="none" aria-hidden="true"><polyline id="spC" fill="none" stroke="var(--text-2)" stroke-width="1.5"/></svg></div>
+      <div class="stat"><div class="k">last seq</div><div class="v" id="sS">0</div></div>
+      <div class="stat"><div class="k">sstables</div><div class="v" id="sT">0</div></div>
+      <div class="stat"><div class="k">write amp</div><div class="v" id="sA">1.00<small>×</small></div></div>
+      <div class="stat"><div class="k">bloom useful</div><div class="v" id="sB">0%</div></div>
+    </div>
+
+    <div class="grid">
+      <div class="col">
+        <section class="panel" aria-labelledby="h-writes">
+          <div class="ph"><b id="h-writes">incoming writes</b><span class="id">01</span></div>
+          <ul class="writes" id="writes" aria-label="Recent commits"></ul>
+        </section>
+        <section class="panel" aria-labelledby="h-mem">
+          <div class="ph"><b id="h-mem">memtable &amp; wal</b><span class="id">02</span></div>
+          <div class="pb">
+            <div class="mem">
+              <div class="tank" id="tank" role="img" aria-label="Memtable fill level"><div class="fill" id="fill"></div><div class="marks"></div></div>
+              <div class="memv"><div class="big" id="memB">0.0 / 4.0 MB</div><div class="sub" id="memE">0 entries · active</div>
+                <div class="sealed" id="sealed"></div></div>
+            </div>
+            <div class="wal"><div class="lbl">wal segments</div><div class="segs" id="segs"></div></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="col center">
+        <section class="panel" aria-labelledby="h-lsm">
+          <div class="ph"><b id="h-lsm">lsm tree · core sample</b><span class="id">03</span></div>
+          <div class="strata-wrap">
+            <div class="strata" id="strata" role="img" aria-label="SSTables by level, placed by key range and sized by bytes">
+              <span class="flushing" id="flushing">↓ flushing memtable into L0</span>
+            </div>
+          </div>
+          <div class="strata-foot">
+            <span class="legend"><span><i style="background:var(--l0)"></i>L0 fresh, overlapping</span><span><i style="background:var(--l1)"></i>L1</span><span><i style="background:var(--l2)"></i>L2</span><span><i style="background:var(--l3)"></i>L3 compacted</span></span>
+            <span><span style="color:var(--ok)">solid green</span> new · <span style="color:var(--amber-ink)">dashed amber</span> merging</span>
+          </div>
+        </section>
+      </div>
+
+      <div class="col">
+        <section class="panel" aria-labelledby="h-bp">
+          <div class="ph"><b id="h-bp">backpressure</b><span class="id">04</span></div>
+          <div class="pb">
+            <div class="ruler" id="ruler" aria-hidden="true"><div class="track"></div><div class="needle" id="needle"></div></div>
+            <div class="bp-state" id="bpS" role="status"><span>L0 files <b id="bpN">0</b></span><b id="bpT">flowing</b></div>
+          </div>
+        </section>
+        <section class="panel" aria-labelledby="h-act">
+          <div class="ph"><b id="h-act">engine activity</b><span class="id">05</span></div>
+          <canvas class="seis" id="seis" aria-hidden="true"></canvas>
+          <ul class="log" id="log" aria-live="polite" aria-label="Engine events"></ul>
+        </section>
+      </div>
+    </div>
+
+    <div class="row2">
+      <section class="panel" aria-labelledby="h-bc">
+        <div class="ph"><b id="h-bc">bloom filters &amp; block cache</b><span class="id">06</span></div>
+        <div class="meter2">
+          <div class="m2"><div class="k">bloom useful</div><div class="v" id="bV">0%</div><div class="c">reads that skipped a file</div><svg viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><polyline id="spB" fill="none" stroke="var(--amber)" stroke-width="1.5"/></svg></div>
+          <div class="m2"><div class="k">cache hit</div><div class="v" id="cV">0%</div><div class="c">blocks served from memory</div><svg viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><polyline id="spK" fill="none" stroke="var(--amber)" stroke-width="1.5"/></svg></div>
+        </div>
+      </section>
+      <section class="panel termp" aria-labelledby="h-try">
+        <div class="ph"><b id="h-try">try it</b><span class="id">07 · via admin proxy</span></div>
+        <div class="term">
+          <div class="out" id="out" aria-live="polite"><div class="res">type a command: SET key value, GET key, DEL key, PING, DBSIZE</div></div>
+          <form id="tform"><span aria-hidden="true">nebula&gt;</span><label for="tin" class="vh">Command</label><input id="tin" autocomplete="off" spellcheck="false" placeholder="SET user:1 naman"></form>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-ctl">
+        <div class="ph"><b id="h-ctl">controls</b><span class="id">08</span></div>
+        <div class="pb ctrls">
+          <button class="hw" id="bWrite">write 500 keys<small>random SETs</small></button>
+          <button class="hw" id="bFlood">flood 20k<small>shows backpressure</small></button>
+          <button class="hw" id="bFlush">flush now<small>seal memtable</small></button>
+          <button class="hw" id="bCompact">compact now<small>merge L0 down</small></button>
+          <div class="kill" id="kill">
+            <button class="fire" id="fire" tabindex="-1" aria-hidden="true">CRASH IT<small>kill -9 the server</small></button>
+            <button class="cover" id="cover" aria-label="Lift the safety cover to arm the crash button">lift cover to arm</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="down-overlay" id="down" role="alertdialog" aria-live="assertive" aria-label="Server crash and recovery">
+      <div class="down-box">
+        <h3 id="downH">signal lost</h3>
+        <div class="sub" id="downS">server received SIGKILL · no shutdown, no flush, no goodbye</div>
+        <ol id="downL"></ol>
+      </div>
+    </div>
+  </div>
+  </div>
+  <p class="note">Motion with a job: writes slide into the list and raise the memtable "pool" (wave on the surface). A full memtable seals into a dashed capsule, then drops into L0 as a fresh sand layer (green outline). When L0 piles up, those files press together (dashed amber, squeezing) and sink as one denser layer into L1 and below. The seismograph traces activity and spikes on flushes and compactions. Crash: the cover flips up, the button arms, then the whole instrument dims, the signal flatlines, and recovery steps print one by one before it comes back online.</p>
+</section>
+
+<!-- ======================= PLATE 02 · ABOUT ======================= -->
+<section class="plate">
+  <div class="plate-bar"><span>plate 02 · about / landing page</span><span>numbers from docs/</span></div>
+  <div class="frame">
+  <div class="about" id="about">
+    <div class="ab-hero">
+      <div>
+        <div class="ab-kicker">redis-compatible · lsm tree · written from scratch in go</div>
+        <h2>a database<br>you can <em>kill.</em></h2>
+        <p>NebulaDB stores your keys like rock stores time: in layers. Fresh writes settle on top, older data is pressed down and compacted. We killed it with <span class="mono">kill -9</span> three thousand times. It never lost a write it said OK to.</p>
+        <div class="ab-cta"><button class="btn-amber">open the inspector</button><button class="btn-line">read the crash report →</button></div>
+      </div>
+      <svg class="core" viewBox="0 0 360 440" role="img" aria-label="A core sample: writes drip into the memtable, then layers L0 to L3 get denser with depth">
+        <defs><pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="2" height="7" fill="rgba(0,0,0,.14)"/></pattern></defs>
+        <circle class="drip" cx="120" cy="40" r="4" fill="var(--amber)"/>
+        <circle class="drip d2" cx="150" cy="40" r="3.5" fill="var(--amber)"/>
+        <circle class="drip d3" cx="132" cy="40" r="3" fill="var(--amber)"/>
+        <rect x="70" y="96" width="140" height="56" rx="8" fill="rgba(255,176,0,.28)" stroke="var(--amber)" stroke-width="1.4"/>
+        <path d="M70 116 q17-7 35 0 t35 0 t35 0 t35 0" fill="none" stroke="var(--amber)" stroke-width="1.4"/>
+        <rect x="70" y="160" width="140" height="44" rx="4" fill="var(--l0)"/><rect x="70" y="160" width="140" height="44" rx="4" fill="url(#hatch)"/>
+        <rect x="70" y="208" width="140" height="56" rx="4" fill="var(--l1)"/><rect x="70" y="208" width="140" height="56" rx="4" fill="url(#hatch)"/>
+        <rect x="70" y="268" width="140" height="70" rx="4" fill="var(--l2)"/><rect x="70" y="268" width="140" height="70" rx="4" fill="url(#hatch)"/>
+        <rect x="70" y="342" width="140" height="80" rx="4" fill="var(--l3)"/><rect x="70" y="342" width="140" height="80" rx="4" fill="url(#hatch)"/>
+        <rect x="66" y="92" width="148" height="334" rx="10" fill="none" stroke="var(--text-2)" stroke-width="1.2"/>
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--text-2)">
+          <path d="M214 50h24" stroke="var(--text-2)"/><text x="244" y="54">writes arrive</text>
+          <path d="M214 124h24" stroke="var(--text-2)"/><text x="244" y="128">memtable · memory</text>
+          <path d="M214 182h24" stroke="var(--text-2)"/><text x="244" y="186">L0 · fresh</text>
+          <path d="M214 236h24" stroke="var(--text-2)"/><text x="244" y="240">L1</text>
+          <path d="M214 303h24" stroke="var(--text-2)"/><text x="244" y="307">L2</text>
+          <path d="M214 382h24" stroke="var(--text-2)"/><text x="244" y="386">L3 · compacted</text>
+          <text x="8" y="160" fill="var(--muted)">newer</text><text x="8" y="426" fill="var(--muted)">older</text>
+          <path d="M28 170v236" stroke="var(--muted)" stroke-dasharray="3 4"/><path d="M24 400l4 8 4-8" fill="none" stroke="var(--muted)"/>
+        </g>
+      </svg>
+    </div>
+    <div class="proof">
+      <div><b>3,000</b><span>kill -9 crashes in the crash test</span></div>
+      <div><b>0</b><span>acknowledged writes lost</span></div>
+      <div><b>12</b><span>fuzz targets, no failures</span></div>
+      <div><b>6</b><span>real bugs caught, each with a regression test</span></div>
+    </div>
+    <div class="ab-sec">
+      <div><h3>How a write travels</h3><p class="lead">From your command to rock, in five steps.</p></div>
+      <div class="steps">
+        <div class="step"><i style="background:var(--amber)"></i><b>01 · wal</b><p>Appended to the write-ahead log with a checksum, then fsynced. Now it survives a crash.</p></div>
+        <div class="step"><i style="background:var(--amber);opacity:.6"></i><b>02 · memtable</b><p>Inserted into a sorted skip list in memory. Reads see it instantly.</p></div>
+        <div class="step"><i style="background:var(--l0)"></i><b>03 · flush</b><p>A full memtable is written out as an immutable, sorted SSTable in L0.</p></div>
+        <div class="step"><i style="background:var(--l1)"></i><b>04 · compaction</b><p>Overlapping files are merged downward; old versions and deleted keys are dropped.</p></div>
+        <div class="step"><i style="background:var(--l3)"></i><b>05 · read</b><p>Newest first. Bloom filters skip files that can't hold the key; hot blocks stay cached.</p></div>
+      </div>
+    </div>
+    <div class="ab-sec">
+      <div><h3>Where it wins, where it loses</h3><p class="lead">Honest results from docs/BENCHMARKS.md. Gaps under ~15–20% are noise.</p></div>
+      <div class="wl">
+        <div class="win"><h4>wins</h4><ul><li>Beats Redis on durable reads at 32 connections</li><li>Matches Pebble on durable writes</li></ul></div>
+        <div class="lose"><h4>loses</h4><ul><li>Large values</li><li>Non-durable writes</li><li>The report explains why, line by line</li></ul></div>
+      </div>
+    </div>
+    <div class="ab-sec" style="border-bottom:0">
+      <div><h3>Try it in a minute</h3><p class="lead">It speaks Redis, so your tools already work.</p></div>
+      <div class="code"><span class="c"># start the server</span>
+<span class="p">$</span> ./nebuladb --data ./data --port 6380
+<span class="c"># talk to it with the real redis-cli</span>
+<span class="p">$</span> redis-cli -p 6380 SET user:1 naman
+OK
+<span class="p">$</span> redis-cli -p 6380 GET user:1
+"naman"</div>
+    </div>
+  </div>
+  </div>
+  <p class="note">Same material as the Inspector: light lowercase headline, mono labels, the core-sample illustration with writes dripping into the memtable pool, real numbers only, and an honest "where it loses" section. The About page follows the Inspector's light/dark theme.</p>
+</section>
+
+<script>
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const $ = s => document.querySelector(s);
+const fmt = n => Math.round(n).toLocaleString('en-US');
+const mb = b => (b / 1048576).toFixed(1);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ---------- theme ---------- */
+$('#themeBtn').addEventListener('click', () => {
+  const r = document.documentElement; r.dataset.theme = r.dataset.theme === 'dark' ? 'light' : 'dark';
+});
+
+/* ---------- simulation state ---------- */
+const S = {
+  seq: 1_204_000, memBytes: 0, memEntries: 0, CAP: 4 * 1048576, sealed: [], segs: [], segN: 41, fileN: 40,
+  levels: [[], [], [], []], flushing: false, compacting: false, crashed: false, burst: 0,
+  userBytes: 1, writtenBytes: 1, bloom: 94, cache: 86, crashes: 0, start: Date.now(), map: new Map(),
+  hist: { w: [], c: [], b: [], k: [] }, seis: new Array(160).fill(0), spike: 0
+};
+const LMAX = [0, 14e6, 60e6, 240e6];
+const SLOW = 6, STOP = 10;
+S.segs.push({ n: S.segN, bytes: 0, el: null });
+
+/* ---------- strata layout ---------- */
+const strata = $('#strata');
+const BANDS = [{ top: 0, h: 118, name: 'L0', sub: 'overlap' }, { top: 124, h: 64, name: 'L1', sub: '' }, { top: 194, h: 64, name: 'L2', sub: '' }, { top: 264, h: 64, name: 'L3', sub: '' }];
+BANDS.forEach((b, i) => {
+  const band = document.createElement('div'); band.className = 'band'; band.style.top = b.top + 'px'; band.style.height = b.h + 'px'; strata.appendChild(band);
+  const l = document.createElement('div'); l.className = 'blabel'; l.style.top = (b.top + 6) + 'px'; l.innerHTML = `${b.name}<small id="lsz${i}">0 MB</small>`; strata.appendChild(l);
+});
+const axis = document.createElement('div'); axis.className = 'axis'; axis.innerHTML = '<span>a</span><span>f</span><span>k</span><span>p</span><span>u</span><span>z</span>'; strata.appendChild(axis);
+
+function placeFile(f){
+  const el = f.el, b = BANDS[f.level];
+  el.className = `file L${f.level}` + (f.fresh ? ' fresh' : '') + (f.merging ? ' merging' : '');
+  el.style.left = `calc((100% - 68px) * ${f.lo} + 68px)`;
+  el.style.width = `calc((100% - 68px) * ${Math.max(.015, f.hi - f.lo)})`;
+  let h, top;
+  if (f.level === 0){ h = 22; top = b.top + 6 + f.row * 27; }
+  else { h = Math.round(18 + 36 * Math.min(1, f.bytes / (LMAX[f.level] / 4))); top = b.top + b.h - 6 - h; }
+  el.style.height = h + 'px'; el.style.top = top + 'px';
+  const wide = f.hi - f.lo > .14;
+  el.innerHTML = wide ? `<span>#${String(f.id).padStart(5, '0')} · ${mb(f.bytes)} MB</span>` : '';
+  el.title = `sstable #${f.id} · L${f.level} · ${mb(f.bytes)} MB`;
+}
+function addFile(level, lo, hi, bytes, fromTop){
+  const f = { id: ++S.fileN, level, lo, hi, bytes, fresh: true, merging: false, row: 0 };
+  if (level === 0){ const used = new Set(S.levels[0].map(x => x.row)); f.row = [0, 1, 2, 3].find(r => !used.has(r)) ?? (S.levels[0].length % 4); }
+  f.el = document.createElement('div');
+  strata.appendChild(f.el);
+  // start above its target, then settle (drop in like a new layer)
+  f.el.className = `file L${level}`; f.el.style.left = `calc((100% - 68px) * ${lo} + 68px)`; f.el.style.width = `calc((100% - 68px) * ${hi - lo})`;
+  f.el.style.top = (fromTop ?? (BANDS[level].top - 40)) + 'px'; f.el.style.height = '18px'; f.el.style.opacity = '0';
+  S.levels[level].push(f);
+  requestAnimationFrame(() => requestAnimationFrame(() => { f.el.style.opacity = ''; placeFile(f); }));
+  setTimeout(() => { f.fresh = false; placeFile(f); }, RM ? 0 : 2200);
+  log('new', '+', `sstable #${f.id} created in L${level} (${mb(bytes)} MB)`);
+  return f;
+}
+function removeFile(f){
+  S.levels[f.level] = S.levels[f.level].filter(x => x !== f);
+  f.el.classList.add('gone'); setTimeout(() => f.el.remove(), RM ? 0 : 450);
+}
+
+/* ---------- log + seismograph ---------- */
+const logEl = $('#log');
+function log(cls, glyph, text){
+  const li = document.createElement('li'); li.className = cls;
+  const t = new Date().toTimeString().slice(0, 8);
+  li.innerHTML = `<span class="t">${t}</span><span class="g">${glyph}</span><span>${text}</span>`;
+  logEl.insertBefore(li, logEl.firstChild);
+  while (logEl.children.length > 12) logEl.lastChild.remove();
+}
+const cv = $('#seis'), cx = cv.getContext('2d');
+function sizeCanvas(){ const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1; cv.width = r.width * d; cv.height = r.height * d; cx.setTransform(d, 0, 0, d, 0, 0); }
+sizeCanvas(); addEventListener('resize', sizeCanvas);
+function drawSeis(){
+  const w = cv.clientWidth, h = cv.clientHeight, st = getComputedStyle(document.documentElement);
+  cx.clearRect(0, 0, w, h);
+  cx.strokeStyle = st.getPropertyValue('--line'); cx.lineWidth = 1;
+  for (let y = h / 4; y < h; y += h / 4){ cx.beginPath(); cx.moveTo(0, y); cx.lineTo(w, y); cx.stroke(); }
+  const n = S.seis.length, step = w / (n - 1);
+  cx.lineWidth = 1.6; cx.strokeStyle = S.crashed ? st.getPropertyValue('--magma') : st.getPropertyValue('--amber');
+  cx.beginPath();
+  S.seis.forEach((v, i) => { const y = h / 2 - v * (h / 2 - 6); i ? cx.lineTo(i * step, y) : cx.moveTo(0, y); });
+  cx.stroke();
+}
+
+/* ---------- sparkline ---------- */
+function spark(id, arr, h, min, max){
+  const el = document.getElementById(id); if (!el) return;
+  const n = arr.length; if (n < 2) return;
+  el.setAttribute('points', arr.map((v, i) => `${(i / (n - 1)) * 120},${h - 2 - ((v - min) / (max - min || 1)) * (h - 4)}`).join(' '));
+}
+
+/* ---------- writes list ---------- */
+const prefixes = ['user', 'session', 'cart', 'order', 'feed', 'rate', 'flag', 'post'];
+const writesEl = $('#writes');
+function addWriteRow(op, key, bytes, you){
+  const li = document.createElement('li'); if (you) li.className = 'you';
+  li.innerHTML = `<span class="op">${op}</span><span class="key">${key}</span><span>${you ? 'you' : fmt(S.seq)}</span>`;
+  writesEl.insertBefore(li, writesEl.firstChild);
+  while (writesEl.children.length > 10) writesEl.lastChild.remove();
+}
+
+/* ---------- memtable / wal rendering ---------- */
+const segsEl = $('#segs'), sealedEl = $('#sealed');
+function renderMem(){
+  $('#fill').style.height = Math.min(100, S.memBytes / S.CAP * 100) + '%';
+  $('#memB').textContent = `${mb(S.memBytes)} / ${mb(S.CAP)} MB`;
+  $('#memE').textContent = `${fmt(S.memEntries)} entries · active`;
+  // segments
+  S.segs.forEach((s, i) => {
+    if (i < S.segs.length - 5){ if (s.el){ s.el.remove(); s.el = null; } return; }
+    if (!s.el){ s.el = document.createElement('div'); s.el.className = 'seg'; s.el.innerHTML = `<div><div class="bar"><i></i></div></div><span></span>`; segsEl.appendChild(s.el); }
+    s.el.classList.toggle('cur', i === S.segs.length - 1);
+    s.el.querySelector('i').style.width = Math.min(100, s.bytes / (S.CAP * 1.05) * 100) + '%';
+    s.el.querySelector('span').textContent = `${String(s.n).padStart(6, '0')}`;
+    s.el.title = `wal-${String(s.n).padStart(6, '0')}.log · ${mb(s.bytes)} MB`;
+  });
+}
+function renderSealed(){
+  sealedEl.innerHTML = '';
+  S.sealed.slice(0, 3).forEach(s => { const d = document.createElement('div'); d.className = 'cap'; d.innerHTML = `<span>sealed #${s.n}</span><span>${mb(s.bytes)} MB</span>`; sealedEl.appendChild(d); });
+  if (S.sealed.length > 3){ const d = document.createElement('div'); d.className = 'cap'; d.innerHTML = `<span>+${S.sealed.length - 3} more waiting</span><span></span>`; sealedEl.appendChild(d); }
+}
+
+/* ---------- engine actions ---------- */
+function seal(){
+  if (S.memBytes < 1) return;
+  S.sealed.push({ n: S.segs[S.segs.length - 1].n, bytes: S.memBytes, seg: S.segs[S.segs.length - 1] });
+  S.memBytes = 0; S.memEntries = 0;
+  S.segs.push({ n: ++S.segN, bytes: 0, el: null });
+  const t = $('#tank'); t.classList.remove('seal'); void t.offsetWidth; t.classList.add('seal');
+  renderSealed(); renderMem();
+  log('flush', '◇', `memtable sealed, new wal segment ${String(S.segN).padStart(6, '0')}`);
+}
+function maybeFlush(){
+  if (S.flushing || !S.sealed.length || S.crashed) return;
+  S.flushing = true; $('#flushing').classList.add('on');
+  log('flush', 'F', 'flush started');
+  setTimeout(() => {
+    if (S.crashed){ S.flushing = false; return; }
+    const s = S.sealed.shift();
+    const lo = rnd(0, .55), hi = Math.min(1, lo + rnd(.25, .55));
+    addFile(0, lo, hi, s.bytes, -30);
+    S.writtenBytes += s.bytes; S.spike = Math.max(S.spike, .75);
+    // wal segment can go now that its data is durable in an sstable
+    const seg = s.seg; if (seg.el){ seg.el.classList.add('gone'); setTimeout(() => seg.el && seg.el.remove(), 450); }
+    S.segs = S.segs.filter(x => x !== seg);
+    log('flush', 'F', `flush done → L0, wal ${String(seg.n).padStart(6, '0')} deleted`);
+    renderSealed(); renderMem();
+    S.flushing = false; $('#flushing').classList.remove('on');
+  }, RM ? 50 : 1300);
+}
+function overlaps(f, lo, hi){ return f.lo < hi && f.hi > lo; }
+function compactLevel(L, force){
+  if (S.compacting || S.crashed) return false;
+  const src = S.levels[L];
+  if (!src.length) return false;
+  let picked;
+  if (L === 0) picked = [...src];
+  else {
+    const tot = src.reduce((a, f) => a + f.bytes, 0);
+    if (!force && tot < LMAX[L]) return false;
+    picked = [src.reduce((a, f) => f.bytes > a.bytes ? f : a, src[0])];
+  }
+  const lo = Math.min(...picked.map(f => f.lo)), hi = Math.max(...picked.map(f => f.hi));
+  const below = S.levels[L + 1].filter(f => overlaps(f, lo, hi));
+  const all = [...picked, ...below];
+  S.compacting = true;
+  all.forEach(f => { f.merging = true; placeFile(f); });
+  log('compact', 'C', `compaction L${L}→L${L + 1}: merging ${all.length} files`);
+  setTimeout(() => {
+    if (S.crashed){ all.forEach(f => { f.merging = false; placeFile(f); }); S.compacting = false; return; }
+    const ulo = Math.min(lo, ...below.map(f => f.lo)), uhi = Math.max(hi, ...below.map(f => f.hi));
+    const bytesIn = all.reduce((a, f) => a + f.bytes, 0), bytesOut = bytesIn * rnd(.78, .9);
+    all.forEach(removeFile);
+    all.forEach(() => log('del', '−', `sstable removed after merge`));
+    const k = Math.max(1, Math.min(4, Math.round((uhi - ulo) / .22)));
+    for (let i = 0; i < k; i++){
+      const a = ulo + (uhi - ulo) * i / k, b = ulo + (uhi - ulo) * (i + 1) / k - .004;
+      addFile(L + 1, a, b, bytesOut / k);
+    }
+    if (L === 0) S.writtenBytes += bytesOut; S.spike = Math.max(S.spike, .95);
+    log('compact', 'C', `compaction done: ${mb(bytesIn)} MB in, ${mb(bytesOut)} MB out`);
+    S.compacting = false;
+  }, RM ? 60 : 1900);
+  return true;
+}
+function maybeCompact(){
+  if (S.compacting || S.crashed) return;
+  if (S.levels[0].length >= 4 && !S.burst) { compactLevel(0); return; }
+  if (S.levels[0].length >= SLOW) { compactLevel(0); return; }
+  for (let L = 1; L < 3; L++) if (compactLevel(L)) return;
+}
+
+/* ---------- tick ---------- */
+let last = performance.now(), statT = 0, wAcc = 0, cAcc = 0;
+function tick(now){
+  const dt = Math.min(.2, (now - last) / 1000); last = now;
+  if (!S.crashed){
+    const l0 = S.levels[0].length;
+    const factor = (l0 >= STOP || S.sealed.length >= 4) ? 0 : (l0 >= SLOW || S.sealed.length >= 2) ? .35 : 1;
+    let rate = rnd(900, 1500) * factor + (S.burst > 0 ? 12000 * factor : 0);
+    let n = rate * dt;
+    if (S.burst > 0){ S.burst = Math.max(0, S.burst - n + rnd(900, 1500) * dt * factor); if (factor === 0) n = 0; }
+    const bytes = n * rnd(140, 260);
+    S.memBytes += bytes; S.memEntries += n; S.seq += n; S.userBytes += bytes; S.writtenBytes += bytes * .02;
+    S.segs[S.segs.length - 1].bytes += bytes;
+    wAcc += n; cAcc += n * rnd(1.6, 2.4);
+    if (Math.random() < Math.min(.9, n / 12)){
+      const p = prefixes[Math.floor(Math.random() * prefixes.length)];
+      addWriteRow(Math.random() < .08 ? 'DEL' : 'SET', `${p}:${Math.floor(rnd(1, 99999))}`, 0, false);
+    }
+    if (S.memBytes >= S.CAP) seal();
+    maybeFlush(); maybeCompact();
+    S.bloom = Math.max(88, Math.min(99, S.bloom + rnd(-.4, .4)));
+    S.cache = Math.max(74, Math.min(95, S.cache + rnd(-.6, .6)));
+    const act = Math.min(1, n / 400) * .35 + S.spike;
+    S.seis.push((Math.random() - .5) * 2 * act + (S.spike ? (Math.random() < .5 ? -1 : 1) * S.spike * .6 : 0));
+    S.spike *= .82; if (S.spike < .02) S.spike = 0;
+    // backpressure
+    const bp = $('#bpS');
+    bp.className = 'bp-state' + (l0 >= STOP ? ' stall' : l0 >= SLOW ? ' slow' : '');
+    $('#bpN').textContent = l0;
+    $('#bpT').textContent = (l0 >= STOP || S.sealed.length >= 4) ? 'writers stalled' : (l0 >= SLOW || S.sealed.length >= 2) ? 'slowing writers' : 'flowing';
+    $('#needle').style.left = Math.min(100, l0 / 12 * 100) + '%';
+    if (l0 >= STOP && !S.stallLogged){ S.stallLogged = true; log('stall', '!', `writes stalled: L0 has ${l0} files (stop limit ${STOP})`); S.spike = 1; }
+    if (l0 < STOP) S.stallLogged = false;
+  } else {
+    S.seis.push(0);
+  }
+  S.seis.shift();
+  renderMem(); drawSeis();
+  statT += dt;
+  if (statT >= .5){
+    const w = wAcc / statT, c = cAcc / statT; statT = 0; wAcc = 0; cAcc = 0;
+    const H = S.hist; H.w.push(w); H.c.push(c); H.b.push(S.bloom); H.k.push(S.cache);
+    for (const k in H) if (H[k].length > 40) H[k].shift();
+    $('#sW').textContent = fmt(w); $('#sC').textContent = fmt(c); $('#sS').textContent = fmt(S.seq);
+    $('#sT').textContent = S.levels.reduce((a, l) => a + l.length, 0);
+    $('#sA').innerHTML = (S.writtenBytes / S.userBytes + 1).toFixed(2) + '<small>×</small>';
+    $('#sB').textContent = S.bloom.toFixed(0) + '%'; $('#bV').textContent = S.bloom.toFixed(1) + '%'; $('#cV').textContent = S.cache.toFixed(1) + '%';
+    spark('spW', H.w, 22, 0, Math.max(...H.w, 2000)); spark('spC', H.c, 22, 0, Math.max(...H.c, 4000));
+    spark('spB', H.b, 30, 85, 100); spark('spK', H.k, 30, 70, 100);
+    S.levels.forEach((l, i) => { const e = document.getElementById('lsz' + i); if (e) e.textContent = mb(l.reduce((a, f) => a + f.bytes, 0)) + ' MB'; });
+    if (!S.crashed){ const s = Math.floor((Date.now() - S.start) / 1000); $('#uptime').textContent = [s / 3600, (s % 3600) / 60, s % 60].map(x => String(Math.floor(x)).padStart(2, '0')).join(':'); }
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ---------- seed some history so the tree isn't empty ---------- */
+[[.05, .3, 9e6], [.3, .62, 11e6], [.62, .98, 10e6]].forEach(([a, b, x]) => { const f = addFile(2, a, b, x * 4); f.fresh = false; });
+[[.0, .45, 12e6], [.45, 1, 14e6]].forEach(([a, b, x]) => { const f = addFile(3, a, b, x * 6); f.fresh = false; });
+[[.1, .35, 3e6], [.35, .7, 3.6e6], [.7, .95, 2.8e6]].forEach(([a, b, x]) => { const f = addFile(1, a, b, x); f.fresh = false; });
+addFile(0, .2, .7, 4e6);
+logEl.innerHTML = '';
+log('recover', '↺', 'server started, 9 sstables opened');
+requestAnimationFrame(tick);
+
+/* ---------- controls ---------- */
+$('#bWrite').addEventListener('click', () => { if (S.crashed) return; for (let i = 0; i < 500; i++){ S.memBytes += rnd(140, 260); S.memEntries++; S.seq++; } S.segs[S.segs.length - 1].bytes += 500 * 200; log('new', '+', '500 random keys written'); S.spike = .5; if (S.memBytes >= S.CAP) seal(); });
+$('#bFlood').addEventListener('click', () => { if (S.crashed) return; S.burst = 20000 * 60; log('stall', '!', 'flood: 20k writes/s for a while'); });
+$('#bFlush').addEventListener('click', () => { if (S.crashed) return; seal(); });
+$('#bCompact').addEventListener('click', () => { if (S.crashed) return; if (!compactLevel(0, true)) compactLevel(1, true); });
+
+/* ---------- try it console ---------- */
+const out = $('#out');
+function say(cls, text){ const d = document.createElement('div'); d.className = cls; d.textContent = text; out.appendChild(d); out.scrollTop = out.scrollHeight; }
+$('#tform').addEventListener('submit', e => {
+  e.preventDefault(); const inp = $('#tin'), raw = inp.value.trim(); if (!raw) return; inp.value = '';
+  say('in', raw);
+  if (S.crashed){ say('err', '(error) connection refused: server is restarting'); return; }
+  const [cmd, k, ...rest] = raw.split(/\s+/); const v = rest.join(' ');
+  switch ((cmd || '').toUpperCase()){
+    case 'PING': say('res', 'PONG'); break;
+    case 'SET': if (!k || !v){ say('err', "(error) wrong number of arguments for 'set'"); break; }
+      S.map.set(k, v); S.seq++; S.memBytes += k.length + v.length + 40; S.memEntries++; addWriteRow('SET', k, 0, true); say('res', 'OK'); break;
+    case 'GET': if (!k){ say('err', "(error) wrong number of arguments for 'get'"); break; } say('res', S.map.has(k) ? `"${S.map.get(k)}"` : '(nil)'); break;
+    case 'DEL': { const had = S.map.delete(k); if (had){ S.seq++; addWriteRow('DEL', k, 0, true); } say('res', `(integer) ${had ? 1 : 0}`); break; }
+    case 'DBSIZE': say('res', `(integer) ${fmt(S.seq - 1_190_000)} (approximate)`); break;
+    default: say('err', `(error) ERR unknown command '${cmd}'`);
+  }
+});
+
+/* ---------- crash: guarded kill switch ---------- */
+const kill = $('#kill'), cover = $('#cover'), fire = $('#fire');
+cover.addEventListener('click', () => {
+  if (S.crashed) return;
+  kill.classList.add('armed'); cover.setAttribute('tabindex', '-1'); cover.setAttribute('aria-hidden', 'true');
+  fire.removeAttribute('tabindex'); fire.removeAttribute('aria-hidden'); fire.focus();
+  clearTimeout(S.disarmT); S.disarmT = setTimeout(disarm, 6000);
+});
+function disarm(){ kill.classList.remove('armed'); cover.removeAttribute('tabindex'); cover.removeAttribute('aria-hidden'); fire.setAttribute('tabindex', '-1'); fire.setAttribute('aria-hidden', 'true'); }
+const sleep = ms => new Promise(r => setTimeout(r, RM ? Math.min(ms, 200) : ms));
+fire.addEventListener('click', async () => {
+  if (S.crashed || !kill.classList.contains('armed')) return;
+  clearTimeout(S.disarmT); disarm();
+  S.crashed = true; S.spike = 0;
+  for (let i = 0; i < 6; i++) S.seis.push(i % 2 ? -1 : 1), S.seis.shift();
+  const memAtCrash = S.memBytes, entriesAtCrash = S.memEntries, segsAtCrash = S.segs.length;
+  const insp = $('#insp'), down = $('#down'), H = $('#downH'), sub = $('#downS'), L = $('#downL');
+  insp.classList.add('dim'); down.classList.add('on'); L.innerHTML = ''; H.className = ''; H.textContent = 'signal lost'; sub.textContent = 'server received SIGKILL · no shutdown, no flush, no goodbye';
+  $('#conn').className = 'conn down'; $('#connT').textContent = 'disconnected · server killed';
+  log('crash', '×', 'kill -9: server process terminated');
+  S.memBytes = 0; S.memEntries = 0; S.sealed = []; renderSealed();
+  const step = (a, b) => { const li = document.createElement('li'); li.innerHTML = `<span>${a}</span><b>${b}</b>`; L.appendChild(li); };
+  await sleep(1400);
+  $('#conn').className = 'conn rec'; $('#connT').textContent = 'recovering…';
+  H.textContent = 'recovering'; H.className = ''; sub.textContent = 'supervisor restarted the process';
+  const tables = S.levels.reduce((a, l) => a + l.length, 0);
+  const recs = Math.round(entriesAtCrash);
+  await sleep(500); step('read CURRENT → MANIFEST', 'ok');
+  await sleep(500); step('open live sstables', `${tables} files`);
+  await sleep(600); step(`replay wal (${segsAtCrash} segment${segsAtCrash > 1 ? 's' : ''})`, `${fmt(recs)} records`);
+  await sleep(500); step('torn tail record', Math.random() < .5 ? 'truncated (bad crc)' : 'none');
+  await sleep(500); step('acknowledged writes lost', '0');
+  S.memBytes = memAtCrash; S.memEntries = entriesAtCrash; renderMem();
+  await sleep(900);
+  H.textContent = 'back online'; H.className = 'ok'; sub.textContent = 'every acknowledged write is still here';
+  await sleep(1200);
+  down.classList.remove('on'); insp.classList.remove('dim');
+  S.crashed = false; S.crashes++; $('#crashN').textContent = S.crashes; S.spike = .9;
+  $('#conn').className = 'conn'; $('#connT').textContent = 'connected · 127.0.0.1:6380';
+  log('recover', '↺', `recovered: ${fmt(recs)} wal records replayed, 0 writes lost`);
+});
+</script>
+</body>
+</html>

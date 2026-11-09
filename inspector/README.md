@@ -2,9 +2,8 @@
 
 A live view of the LSM tree: it connects to the server's admin port (`-admin-addr`,
 default `127.0.0.1:7380`), listens to the Server-Sent-Events stream of engine
-events and polls the JSON endpoints. Functional and deliberately unstyled beyond
-a clean baseline: **the visual design is applied later in one place** (see
-"Styling" below).
+events and polls the JSON endpoints. Styled with the **Strata** design system (see NOTES.md, "Design system", and
+`design/nebuladb-design-reference.html`, the source of truth).
 
 ## Run
 
@@ -35,29 +34,28 @@ cd inspector && npm install && npm run dev   # http://127.0.0.1:5173
 ## Structure
 
 ```
-src/api/        types.ts (server JSON), client.ts (fetch + SSE), useAdmin.ts (batching hook)
-src/lib/        reducer.ts (all UI state, pure + tested), keymap.ts (key -> x position),
-                format.ts, args.ts (redis-cli style argument splitting)
-src/components/ one file per panel (+ primitives.tsx: Card, StatCard, Badge, Meter, Sparkline)
+src/api/        types.ts (server JSON), client.ts (fetch + SSE), useAdmin.ts (rAF-batched hook)
+src/lib/        reducer.ts (all UI state, pure + tested), strata.ts (core-sample geometry),
+                keymap.ts, reply.ts (redis-cli formatting), crash.ts (recovery steps),
+                spark.ts, hooks.ts (useWidth, useGhosts = diff-driven exit animations), format.ts, args.ts
+src/components/ one file per panel; useCrashFlow.ts drives the crash overlay from real signals
 src/pages/      Inspector.tsx, About.tsx
-src/styles/     tokens.css (ALL colours, sizes, radii, motion durations), base.css, components.css
+src/styles/     tokens.css (ALL colours, radii, motion), base.css (fonts, reset, focus), components.css
 ```
 
 ## Styling is centralised
 
-Every colour, size, radius and duration is a CSS variable in `src/styles/tokens.css`
-(light and dark defined; `<html data-theme>` or the OS picks one). `components.css`
-uses only those variables, and every visual element has a class there. Nothing is
-styled inline except computed geometry (meter widths, SVG positions).
+Every colour, radius and duration is a CSS variable in `src/styles/tokens.css`
+(dark is the default set; light is applied by `prefers-color-scheme` or
+`<html data-theme>`). `components.css` uses only those tokens. Inline styles are
+used only for computed geometry (positions, widths, fill heights). Fonts (IBM Plex
+Sans and Mono) are self-hosted through `@fontsource`, so the page makes no external requests.
 
-## Screens and components (baseline screenshots in `screenshots/baseline/`)
+## Screenshots
 
-Screens: Inspector (empty / active / after Try it), crash outage, crash recovered,
-About; each in light and dark, plus mobile (390 px) for Inspector and About.
-
-Components: Header (title, nav, connection badge, theme select), CrashBanner,
-Overview stat row (6 StatCards), WriteFeed, MemoryPanel (Meters), LevelsPanel
-(SVG: level rows, table rectangles placed by key range and sized by bytes, fresh
-and merging outlines), BackpressurePanel (Meter with threshold marker),
-ActivityLog, FiltersPanel (Bloom + Block cache with Sparklines), TryIt,
-DevPanel (flush / compact / crash / demo load), and the About page's prose.
+`screenshots/baseline/` (functional Phase 11 UI), `screenshots/reference/` (the design
+reference rendered), `screenshots/after/` (Strata UI: light/dark, 1440/1024/768/390 px,
+every panel, armed kill switch, crash overlay stages, the "writers stalled" state).
+Regenerate: `SCRIPT=scripts/screenshots-strata.mjs OUT=screenshots/after scripts/run-screenshots.sh`.
+The script starts a server with deliberately small limits (64 KiB memtable, L0 slowdown 4 / stop 6,
+throttled compaction) so a flood reaches backpressure.

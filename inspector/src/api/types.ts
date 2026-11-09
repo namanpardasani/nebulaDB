@@ -6,6 +6,7 @@ export interface Health {
   dev: boolean
   engine: boolean
   supervised: boolean
+  addr?: string
 }
 
 export interface LevelMetrics { files: number; bytes: number }
@@ -60,6 +61,7 @@ export interface EngineMetrics {
   recovery_torn_tail: boolean
   recovery_truncated_bytes: number
   manifest_number: number
+  recovery_segments: number
 }
 
 export interface LatencyStats { count: number; p50_us: number; p99_us: number; p999_us: number; mean_us: number }
@@ -89,7 +91,10 @@ export interface FileInfo {
   largest: string
 }
 
+export interface WALSeg { num: number; bytes: number }
+
 export interface MemInfo {
+  wal_segments?: WALSeg[] | null
   active_bytes: number
   active_entries: number
   threshold: number
@@ -122,6 +127,11 @@ export interface Tick {
   bloom_skipped: number
   wal_fsyncs: number
   wal_bytes: number
+  last_seq: number
+  table_files: number
+  write_amp: number
+  bloom_useful: number
+  uptime_seconds: number
   stalled: boolean
   slowed: boolean
   recent_writes: WriteSample[] | null
@@ -130,6 +140,8 @@ export interface Tick {
 export type EngineEventType =
   | 'memtable_sealed' | 'flush_start' | 'flush_end' | 'file_created' | 'file_deleted'
   | 'compaction_start' | 'compaction_end' | 'write_stall' | 'wal_rotated' | 'recovery'
+  /** client-side only: the stream dropped / came back */
+  | 'connection_lost' | 'connection_restored'
 
 export interface EngineEvent {
   type: EngineEventType

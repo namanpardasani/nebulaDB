@@ -1,34 +1,33 @@
 import type { DevAction } from '../api/client'
 import type { InspectorState } from '../lib/reducer'
-import { ActivityLog } from '../components/ActivityLog'
-import { BackpressurePanel } from '../components/BackpressurePanel'
-import { CrashBanner } from '../components/CrashBanner'
-import { DevPanel } from '../components/DevPanel'
-import { FiltersPanel } from '../components/FiltersPanel'
-import { LevelsPanel } from '../components/LevelsPanel'
+import { Activity } from '../components/Activity'
+import { Backpressure } from '../components/Backpressure'
+import { Controls } from '../components/Controls'
+import { Filters } from '../components/Filters'
 import { MemoryPanel } from '../components/MemoryPanel'
-import { Overview } from '../components/Overview'
+import { StatsStrip } from '../components/StatsStrip'
+import { StrataPanel } from '../components/StrataPanel'
 import { TryIt } from '../components/TryIt'
 import { WriteFeed } from '../components/WriteFeed'
 
-export function Inspector({ state, action }: { state: InspectorState; action: (a: DevAction) => Promise<{ ok: boolean; message: string }> }) {
+export function Inspector({ state, action, crash, onWrite }: {
+  state: InspectorState
+  action: (a: DevAction) => Promise<{ ok: boolean; message: string }>
+  crash: () => Promise<{ ok: boolean; message: string }>
+  onWrite: (op: string, key: string) => void
+}) {
   return (
-    <main className="page">
-      <CrashBanner state={state} />
-      <Overview state={state} />
-      <div className="grid-2">
-        <WriteFeed state={state} />
-        <MemoryPanel state={state} />
+    <main>
+      <StatsStrip state={state} />
+      <div className="grid">
+        <div className="col"><WriteFeed state={state} /><MemoryPanel state={state} /></div>
+        <div className="col center"><StrataPanel state={state} /></div>
+        <div className="col"><Backpressure state={state} /><Activity state={state} /></div>
       </div>
-      <LevelsPanel state={state} />
-      <div className="grid-2">
-        <BackpressurePanel state={state} />
-        <ActivityLog state={state} />
-      </div>
-      <FiltersPanel state={state} />
-      <div className="grid-2">
-        <TryIt />
-        <DevPanel state={state} action={action} />
+      <div className="row2">
+        <Filters state={state} />
+        <TryIt onWrite={onWrite} />
+        <Controls state={state} action={action} crash={crash} />
       </div>
     </main>
   )
